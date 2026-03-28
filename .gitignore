@@ -1,0 +1,25 @@
+# Godot 4+
+.godot/
+
+# Godot import cache (legacy path)
+.import/
+
+# Exports / secrets
+export.cfg
+export_presets.cfg
+
+# Mono (if used)
+.mono/
+data_*/
+mono_crash.*.json
+
+# Imported translations (generated)
+*.translation
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*~
+
+# Local logs
+debug.log

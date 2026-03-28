@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://o5exglgsmic3"
+path="res://.godot/imported/swe_velocity.glsl-377a3cd2bde50b543b0c4bc17826b42b.res"
+
+[deps]
+
+source_file="res://shaders/swe_velocity.glsl"
+dest_files=["res://.godot/imported/swe_velocity.glsl-377a3cd2bde50b543b0c4bc17826b42b.res"]
+
+[params]
+

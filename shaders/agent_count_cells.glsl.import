@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dqr4t3jaquaq6"
+path="res://.godot/imported/agent_count_cells.glsl-6bcbb1d4b6ed7653c05f31cc73f298c4.res"
+
+[deps]
+
+source_file="res://shaders/agent_count_cells.glsl"
+dest_files=["res://.godot/imported/agent_count_cells.glsl-6bcbb1d4b6ed7653c05f31cc73f298c4.res"]
+
+[params]
+
