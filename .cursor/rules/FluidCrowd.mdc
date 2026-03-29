@@ -4,3 +4,4 @@ alwaysApply: true
 
 
 在Godot中实现流体驱动群集
+该项目尽可能使用computeshader进行计算

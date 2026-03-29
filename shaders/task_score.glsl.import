@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://d2kar2acob6e7"
+path="res://.godot/imported/task_score.glsl-4f893ed24ebf08e1a47d0e2253cc8cad.res"
+
+[deps]
+
+source_file="res://shaders/task_score.glsl"
+dest_files=["res://.godot/imported/task_score.glsl-4f893ed24ebf08e1a47d0e2253cc8cad.res"]
+
+[params]
+

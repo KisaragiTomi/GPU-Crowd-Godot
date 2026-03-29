@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cs11yhb2iepgb"
+path="res://.godot/imported/agent_combat.glsl-b7d6f7279c13463fab0e9fac19dbb1c4.res"
+
+[deps]
+
+source_file="res://shaders/agent_combat.glsl"
+dest_files=["res://.godot/imported/agent_combat.glsl-b7d6f7279c13463fab0e9fac19dbb1c4.res"]
+
+[params]
+

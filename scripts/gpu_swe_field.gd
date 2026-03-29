@@ -1,24 +1,21 @@
 class_name GPUSWEField
 extends RefCounted
-## GPU-accelerated Shallow Water Equation velocity field.
-##
-## Accepts an external RenderingDevice (shared with GPUAgents).
-## Density buffer is written by GPUAgents; this class only reads it.
-## dispatch_swe / dispatch_velocity append to a caller-owned compute list.
 
 var gw: int
 var gh: int
 var cs: float
 var cell_count: int
+var max_groups: int
 
-# CPU-side arrays (static env + optional readback)
+# CPU-side arrays
 var terrain: PackedFloat32Array
-var goal_dist: PackedFloat32Array
-var density: PackedFloat32Array
-var gdir_x: PackedFloat32Array
-var gdir_y: PackedFloat32Array
-var out_vx: PackedFloat32Array
-var out_vy: PackedFloat32Array
+var goal_dist: PackedFloat32Array           # cell_count (flux shader only)
+var goal_dist_all: PackedFloat32Array       # cell_count * max_groups (combat)
+var density: PackedFloat32Array             # cell_count (readback)
+var gdir_x: PackedFloat32Array              # cell_count * max_groups (velocity)
+var gdir_y: PackedFloat32Array              # cell_count * max_groups (velocity)
+var out_vx: PackedFloat32Array              # cell_count (readback/display)
+var out_vy: PackedFloat32Array              # cell_count (readback/display)
 
 # Tuning
 var gravity := 25.0
@@ -35,6 +32,7 @@ var rd: RenderingDevice
 
 var buf_density: RID
 var buf_goal_dist: RID
+var buf_goal_dist_all: RID
 var buf_terrain: RID
 var buf_fr: RID
 var buf_fl: RID
@@ -56,20 +54,23 @@ var groups_x: int
 var groups_y: int
 
 
-func _init(rendering_device: RenderingDevice, width: int, height: int, cell_size: float) -> void:
+func _init(rendering_device: RenderingDevice, width: int, height: int,
+		   cell_size: float, p_max_groups: int = 1) -> void:
 	rd = rendering_device
 	gw = width
 	gh = height
 	cs = cell_size
 	cell_count = gw * gh
+	max_groups = maxi(p_max_groups, 1)
 
-	terrain   = PackedFloat32Array(); terrain.resize(cell_count)
-	goal_dist = PackedFloat32Array(); goal_dist.resize(cell_count); goal_dist.fill(1e6)
-	density   = PackedFloat32Array(); density.resize(cell_count)
-	gdir_x    = PackedFloat32Array(); gdir_x.resize(cell_count)
-	gdir_y    = PackedFloat32Array(); gdir_y.resize(cell_count)
-	out_vx    = PackedFloat32Array(); out_vx.resize(cell_count)
-	out_vy    = PackedFloat32Array(); out_vy.resize(cell_count)
+	terrain       = PackedFloat32Array(); terrain.resize(cell_count)
+	goal_dist     = PackedFloat32Array(); goal_dist.resize(cell_count); goal_dist.fill(1e6)
+	goal_dist_all = PackedFloat32Array(); goal_dist_all.resize(cell_count * max_groups); goal_dist_all.fill(1e6)
+	density       = PackedFloat32Array(); density.resize(cell_count)
+	gdir_x        = PackedFloat32Array(); gdir_x.resize(cell_count * max_groups)
+	gdir_y        = PackedFloat32Array(); gdir_y.resize(cell_count * max_groups)
+	out_vx        = PackedFloat32Array(); out_vx.resize(cell_count)
+	out_vy        = PackedFloat32Array(); out_vy.resize(cell_count)
 
 	groups_x = ceili(float(gw) / 8.0)
 	groups_y = ceili(float(gh) / 8.0)
@@ -81,7 +82,7 @@ func idx(x: int, y: int) -> int:
 	return y * gw + x
 
 
-# ── Environment setup (CPU, one-time) ───────────────────────────────────
+# ── Environment setup (CPU) ─────────────────────────────────────────────
 
 func add_wall(x0: int, y0: int, x1: int, y1: int) -> void:
 	for yy in range(maxi(y0, 0), mini(y1, gh)):
@@ -90,88 +91,128 @@ func add_wall(x0: int, y0: int, x1: int, y1: int) -> void:
 
 
 func build_goal_field(goals: Array[Vector2i]) -> void:
-	goal_dist.fill(1e6)
-	var q: Array[int] = []
+	_bfs_into(goal_dist, goals)
+	for i in range(cell_count):
+		goal_dist_all[i] = goal_dist[i]
+	_compute_gradient_for(goal_dist, 0)
+
+
+func build_all_goal_fields(group_goals: Array) -> void:
+	goal_dist_all.fill(1e6)
+	var tmp := PackedFloat32Array()
+	tmp.resize(cell_count)
+	for g in range(mini(group_goals.size(), max_groups)):
+		tmp.fill(1e6)
+		_bfs_into(tmp, group_goals[g])
+		var off := g * cell_count
+		for i in range(cell_count):
+			goal_dist_all[off + i] = tmp[i]
+		_compute_gradient_for(tmp, g)
+	for i in range(cell_count):
+		goal_dist[i] = goal_dist_all[i]
+
+
+func _bfs_into(dist: PackedFloat32Array, goals) -> void:
+	dist.fill(1e6)
+	var q := PackedInt32Array()
+	q.resize(cell_count * 2)
+	var tail := 0
 	for g in goals:
-		if g.x >= 0 and g.x < gw and g.y >= 0 and g.y < gh:
-			if terrain[idx(g.x, g.y)] < 0.5:
-				goal_dist[idx(g.x, g.y)] = 0.0
-				q.append(idx(g.x, g.y))
+		var gv: Vector2i
+		if g is Vector2i:
+			gv = g
+		else:
+			gv = Vector2i(int(g.x), int(g.y))
+		if gv.x >= 0 and gv.x < gw and gv.y >= 0 and gv.y < gh:
+			var gi := idx(gv.x, gv.y)
+			if terrain[gi] < 0.5 and dist[gi] > 0.5:
+				dist[gi] = 0.0
+				q[tail] = gi
+				tail += 1
 	var head := 0
-	var DX: Array[int] = [1, -1, 0, 0]
-	var DY: Array[int] = [0, 0, 1, -1]
-	while head < q.size():
+	while head < tail:
 		var ci := q[head]; head += 1
 		var cx := ci % gw
 		var cy := ci / gw
-		var cd := goal_dist[ci]
-		for d in range(4):
-			var nx := cx + DX[d]
-			var ny := cy + DY[d]
-			if nx < 0 or nx >= gw or ny < 0 or ny >= gh:
-				continue
-			var ni := idx(nx, ny)
-			if terrain[ni] > 0.5:
-				continue
-			if cd + 1.0 < goal_dist[ni]:
-				goal_dist[ni] = cd + 1.0
-				q.append(ni)
+		var nd := dist[ci] + 1.0
+		if cx > 0:
+			var ni := ci - 1
+			if terrain[ni] < 0.5 and nd < dist[ni]:
+				dist[ni] = nd; q[tail] = ni; tail += 1
+		if cx < gw - 1:
+			var ni := ci + 1
+			if terrain[ni] < 0.5 and nd < dist[ni]:
+				dist[ni] = nd; q[tail] = ni; tail += 1
+		if cy > 0:
+			var ni := ci - gw
+			if terrain[ni] < 0.5 and nd < dist[ni]:
+				dist[ni] = nd; q[tail] = ni; tail += 1
+		if cy < gh - 1:
+			var ni := ci + gw
+			if terrain[ni] < 0.5 and nd < dist[ni]:
+				dist[ni] = nd; q[tail] = ni; tail += 1
 	var max_d := 0.0
 	for i in range(cell_count):
-		if goal_dist[i] < 1e5:
-			max_d = maxf(max_d, goal_dist[i])
+		if dist[i] < 1e5:
+			max_d = maxf(max_d, dist[i])
+	var fill_d := max_d + 1.0
 	for i in range(cell_count):
-		if goal_dist[i] >= 1e5:
-			goal_dist[i] = max_d + 1.0
-	_compute_goal_gradient()
+		if dist[i] >= 1e5:
+			dist[i] = fill_d
 
 
-func _compute_goal_gradient() -> void:
+func _compute_gradient_for(dist: PackedFloat32Array, group: int) -> void:
+	var off := group * cell_count
+	var w := gw
 	for y in range(gh):
-		for x in range(gw):
-			var i := idx(x, y)
+		var row := y * w
+		for x in range(w):
+			var i := row + x
 			if terrain[i] > 0.5:
-				gdir_x[i] = 0.0; gdir_y[i] = 0.0
+				gdir_x[off + i] = 0.0; gdir_y[off + i] = 0.0
 				continue
 			var ddx := 0.0
 			var ddy := 0.0
-			if x > 0 and x < gw - 1:
-				ddx = goal_dist[idx(x + 1, y)] - goal_dist[idx(x - 1, y)]
-			elif x == 0 and gw > 1:
-				ddx = goal_dist[idx(1, y)] - goal_dist[i]
-			elif x == gw - 1 and gw > 1:
-				ddx = goal_dist[i] - goal_dist[idx(gw - 2, y)]
+			if x > 0 and x < w - 1:
+				ddx = dist[i + 1] - dist[i - 1]
+			elif x == 0 and w > 1:
+				ddx = dist[i + 1] - dist[i]
+			elif x == w - 1 and w > 1:
+				ddx = dist[i] - dist[i - 1]
 			if y > 0 and y < gh - 1:
-				ddy = goal_dist[idx(x, y + 1)] - goal_dist[idx(x, y - 1)]
+				ddy = dist[i + w] - dist[i - w]
 			elif y == 0 and gh > 1:
-				ddy = goal_dist[idx(x, 1)] - goal_dist[i]
+				ddy = dist[i + w] - dist[i]
 			elif y == gh - 1 and gh > 1:
-				ddy = goal_dist[i] - goal_dist[idx(x, gh - 2)]
+				ddy = dist[i] - dist[i - w]
 			var l := sqrt(ddx * ddx + ddy * ddy)
 			if l > 1e-6:
-				gdir_x[i] = -ddx / l
-				gdir_y[i] = -ddy / l
+				gdir_x[off + i] = -ddx / l
+				gdir_y[off + i] = -ddy / l
 			else:
-				gdir_x[i] = 0.0; gdir_y[i] = 0.0
+				gdir_x[off + i] = 0.0; gdir_y[off + i] = 0.0
 
 
 # ── GPU init ─────────────────────────────────────────────────────────────
 
 func _init_gpu() -> void:
-	var n_bytes := cell_count * 4
+	var n := cell_count * 4
+	var ng := cell_count * max_groups * 4
 	var zb := _zero_bytes(cell_count)
+	var zgb := _zero_bytes(cell_count * max_groups)
 
-	buf_density   = rd.storage_buffer_create(n_bytes, zb)
-	buf_goal_dist = rd.storage_buffer_create(n_bytes, zb)
-	buf_terrain   = rd.storage_buffer_create(n_bytes, zb)
-	buf_fr        = rd.storage_buffer_create(n_bytes, zb)
-	buf_fl        = rd.storage_buffer_create(n_bytes, zb)
-	buf_fd        = rd.storage_buffer_create(n_bytes, zb)
-	buf_fu        = rd.storage_buffer_create(n_bytes, zb)
-	buf_gdir_x    = rd.storage_buffer_create(n_bytes, zb)
-	buf_gdir_y    = rd.storage_buffer_create(n_bytes, zb)
-	buf_out_vx    = rd.storage_buffer_create(n_bytes, zb)
-	buf_out_vy    = rd.storage_buffer_create(n_bytes, zb)
+	buf_density       = rd.storage_buffer_create(n, zb)
+	buf_goal_dist     = rd.storage_buffer_create(n, zb)
+	buf_goal_dist_all = rd.storage_buffer_create(ng, zgb)
+	buf_terrain       = rd.storage_buffer_create(n, zb)
+	buf_fr            = rd.storage_buffer_create(n, zb)
+	buf_fl            = rd.storage_buffer_create(n, zb)
+	buf_fd            = rd.storage_buffer_create(n, zb)
+	buf_fu            = rd.storage_buffer_create(n, zb)
+	buf_gdir_x        = rd.storage_buffer_create(ng, zgb)
+	buf_gdir_y        = rd.storage_buffer_create(ng, zgb)
+	buf_out_vx        = rd.storage_buffer_create(ng, zgb)
+	buf_out_vy        = rd.storage_buffer_create(ng, zgb)
 
 	var flux_spirv := (load("res://shaders/swe_flux.glsl") as RDShaderFile).get_spirv()
 	shader_flux   = rd.shader_create_from_spirv(flux_spirv)
@@ -208,10 +249,14 @@ func _ubuf(binding: int, buf: RID) -> RDUniform:
 # ── Static data upload ──────────────────────────────────────────────────
 
 func upload_static_data() -> void:
-	_upload(buf_terrain,   terrain)
+	_upload(buf_terrain, terrain)
 	_upload(buf_goal_dist, goal_dist)
-	_upload(buf_gdir_x,    gdir_x)
-	_upload(buf_gdir_y,    gdir_y)
+	var gx_bytes := gdir_x.to_byte_array()
+	rd.buffer_update(buf_gdir_x, 0, gx_bytes.size(), gx_bytes)
+	var gy_bytes := gdir_y.to_byte_array()
+	rd.buffer_update(buf_gdir_y, 0, gy_bytes.size(), gy_bytes)
+	var gda_bytes := goal_dist_all.to_byte_array()
+	rd.buffer_update(buf_goal_dist_all, 0, gda_bytes.size(), gda_bytes)
 
 
 func _upload(buf: RID, arr: PackedFloat32Array) -> void:
@@ -239,7 +284,7 @@ func dispatch_swe(cl: int, swe_dt: float) -> void:
 	rd.compute_list_dispatch(cl, groups_x, groups_y, 1)
 
 
-func dispatch_velocity(cl: int) -> void:
+func dispatch_velocity(cl: int, num_groups: int = 1) -> void:
 	var push := PackedByteArray(); push.resize(16)
 	push.encode_s32(0, gw)
 	push.encode_s32(4, gh)
@@ -248,18 +293,18 @@ func dispatch_velocity(cl: int) -> void:
 	rd.compute_list_bind_compute_pipeline(cl, pipeline_vel)
 	rd.compute_list_bind_uniform_set(cl, uset_vel, 0)
 	rd.compute_list_set_push_constant(cl, push, push.size())
-	rd.compute_list_dispatch(cl, groups_x, groups_y, 1)
+	rd.compute_list_dispatch(cl, groups_x, groups_y, num_groups)
 
 
-# ── Optional readback (for overlays) ────────────────────────────────────
+# ── Readback ─────────────────────────────────────────────────────────────
 
 func readback_density() -> void:
 	density = rd.buffer_get_data(buf_density).to_float32_array()
 
 func readback_velocity() -> void:
-	out_vx = rd.buffer_get_data(buf_out_vx).to_float32_array()
-	out_vy = rd.buffer_get_data(buf_out_vy).to_float32_array()
-
+	var sz := cell_count * 4
+	out_vx = rd.buffer_get_data(buf_out_vx, 0, sz).to_float32_array()
+	out_vy = rd.buffer_get_data(buf_out_vy, 0, sz).to_float32_array()
 
 func reset_flux() -> void:
 	var bytes := _zero_bytes(cell_count)
@@ -285,7 +330,7 @@ func cleanup() -> void:
 	rd.free_rid(pipeline_vel)
 	rd.free_rid(shader_flux)
 	rd.free_rid(shader_vel)
-	for buf in [buf_density, buf_goal_dist, buf_terrain,
+	for buf in [buf_density, buf_goal_dist, buf_goal_dist_all, buf_terrain,
 				buf_fr, buf_fl, buf_fd, buf_fu,
 				buf_gdir_x, buf_gdir_y, buf_out_vx, buf_out_vy]:
 		rd.free_rid(buf)

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bulylghpj6n17"
+path="res://.godot/imported/task_navigate.glsl-5482b7821b1eb38ff7d79d50f5d3a01d.res"
+
+[deps]
+
+source_file="res://shaders/task_navigate.glsl"
+dest_files=["res://.godot/imported/task_navigate.glsl-5482b7821b1eb38ff7d79d50f5d3a01d.res"]
+
+[params]
+

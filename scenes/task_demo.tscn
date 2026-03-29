@@ -1,0 +1,10 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/task_sim.gd" id="1"]
+
+[node name="TaskSim" type="Node2D"]
+script = ExtResource("1")
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(480, 300)
+zoom = Vector2(1.15, 1.15)

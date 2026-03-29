@@ -21,16 +21,49 @@ layout(push_constant, std430) uniform Params {
 	float density_slowdown;
 };
 
+shared uint s_busy;
+
 void main() {
 	int x = int(gl_GlobalInvocationID.x);
 	int y = int(gl_GlobalInvocationID.y);
-	if (x >= gw || y >= gh) return;
+	int li = int(gl_LocalInvocationIndex);
 
+	int group = int(gl_GlobalInvocationID.z);
+	int gbase = group * gw * gh;
+
+	if (li == 0) s_busy = 0u;
+	barrier();
+
+	// Block-level probe: any cell with density or residual flux?
+	if (x < gw && y < gh) {
+		int i = y * gw + x;
+		if (terrain[i] < 0.5) {
+			float flux_sum = abs(fr[i]) + abs(fl[i]) + abs(fd[i]) + abs(fu[i]);
+			if (density[i] > 0.001 || flux_sum > 0.01)
+				atomicOr(s_busy, 1u);
+		}
+	}
+	barrier();
+
+	if (s_busy == 0u) {
+		// Fast path: no agents, no flux — write static goal-gradient velocity
+		if (x < gw && y < gh) {
+			int i = y * gw + x;
+			if (terrain[i] > 0.5) {
+				out_vx[gbase + i] = 0.0; out_vy[gbase + i] = 0.0;
+			} else {
+				out_vx[gbase + i] = gdir_x[gbase + i] * agent_speed;
+				out_vy[gbase + i] = gdir_y[gbase + i] * agent_speed;
+			}
+		}
+		return;
+	}
+
+	if (x >= gw || y >= gh) return;
 	int i = y * gw + x;
 
 	if (terrain[i] > 0.5) {
-		out_vx[i] = 0.0;
-		out_vy[i] = 0.0;
+		out_vx[gbase + i] = 0.0; out_vy[gbase + i] = 0.0;
 		return;
 	}
 
@@ -38,16 +71,23 @@ void main() {
 	float fy   = fd[i] - fu[i];
 	float fmag = sqrt(fx * fx + fy * fy);
 
-	float dir_x, dir_y;
-	if (fmag > 0.001) {
-		dir_x = fx / fmag;
-		dir_y = fy / fmag;
-	} else {
-		dir_x = gdir_x[i];
-		dir_y = gdir_y[i];
+	float gx = gdir_x[gbase + i];
+	float gy = gdir_y[gbase + i];
+
+	float dir_x = gx;
+	float dir_y = gy;
+	if (fmag > 0.01) {
+		float avoidance = min(fmag * 0.05, 1.0);
+		dir_x += (fx / fmag) * avoidance;
+		dir_y += (fy / fmag) * avoidance;
+	}
+	float dlen = sqrt(dir_x * dir_x + dir_y * dir_y);
+	if (dlen > 0.001) {
+		dir_x /= dlen;
+		dir_y /= dlen;
 	}
 
 	float local_speed = agent_speed / (1.0 + density[i] * density_slowdown);
-	out_vx[i] = dir_x * local_speed;
-	out_vy[i] = dir_y * local_speed;
+	out_vx[gbase + i] = dir_x * local_speed;
+	out_vy[gbase + i] = dir_y * local_speed;
 }
