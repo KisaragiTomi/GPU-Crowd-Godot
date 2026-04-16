@@ -402,10 +402,10 @@ void main() {
 			float smx = tgt_x - npx;
 			float smy = tgt_y - npy;
 			float smd = sqrt(smx * smx + smy * smy);
-		if (smd > 0.1) {
-			float sstep = min(80.0 * dt, smd);
-			npx += (smx / smd) * sstep;
-			npy += (smy / smd) * sstep;
+			if (smd > 0.1) {
+				float sstep = min(80.0 * dt, smd);
+				npx += (smx / smd) * sstep;
+				npy += (smy / smd) * sstep;
 			} else {
 				npx = tgt_x;
 				npy = tgt_y;
