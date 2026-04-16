@@ -17,11 +17,13 @@ layout(set = 0, binding = 10, std430) restrict readonly  buffer B10 { uint  si_b
 layout(set = 0, binding = 11, std430) restrict readonly  buffer B11 { float terrain[];   };
 layout(set = 0, binding = 12, std430) restrict           buffer B12 { float stall[];     };
 
-layout(set = 1, binding = 0, std430) restrict readonly buffer S1B0 { uint  agent_info[];    };
+layout(set = 1, binding = 0, std430) restrict          buffer S1B0 { uint  agent_info[];    };
 layout(set = 1, binding = 1, std430) restrict readonly buffer S1B1 { float out_vx_all[];   };
 layout(set = 1, binding = 2, std430) restrict readonly buffer S1B2 { float out_vy_all[];   };
 layout(set = 1, binding = 3, std430) restrict readonly buffer S1B3 { uint  fac_to_group[]; };
 layout(set = 1, binding = 4, std430) restrict          buffer S1B4 { uint  corpse_map[];   };
+layout(set = 1, binding = 5, std430) restrict          buffer S1B5 { uint  cell_attacker[]; };
+layout(set = 1, binding = 6, std430) restrict          buffer S1B6 { float cooldown_buf[];  };
 
 layout(push_constant, std430) uniform Params {
 	int   agent_count;    // 0
@@ -124,6 +126,7 @@ void main() {
 	// --- neighbor separation via cell buffer ---
 	float vsx = 0.0, vsy = 0.0;
 	int n_count = 0;
+	float atk_impede = 0.0;
 	int hcx = clamp(int(px * sg_inv_cs), 0, sg_w - 1);
 	int hcy = clamp(int(py * sg_inv_cs), 0, sg_h - 1);
 	for (int ny = max(hcy - 1, 0); ny <= min(hcy + 1, sg_h - 1); ny++) {
@@ -143,6 +146,21 @@ void main() {
 					float dd = sqrt(dsq);
 					float f  = 1.0 - dd * inv_sep_r;
 					float ff = sep_strength * f * f / dd;
+
+					if ((info & (1u << 9u)) == 0u) {
+						uint jv = agent_info[j];
+						if ((jv & (1u << 9u)) != 0u) {
+							uint jg = fac_to_group[(jv >> 1u) & 0x1Fu];
+							if (jg != group) {
+								ff *= 3.0;
+								atk_impede = max(atk_impede, f);
+							} else {
+								ff *= 2.0;
+								atk_impede = max(atk_impede, f * 0.5);
+							}
+						}
+					}
+
 					vsx += djx * ff;
 					vsy += djy * ff;
 					n_count++;
@@ -160,6 +178,32 @@ void main() {
 	if (terrain[ti - 1] > 0.5)        wpx += 1.0;
 	if (terrain[ti + field_gw] > 0.5)  wpy -= 1.0;
 	if (terrain[ti - field_gw] > 0.5)  wpy += 1.0;
+
+	// --- friendly attacker cell avoidance (non-attackers only) ---
+	if ((info & (1u << 9u)) == 0u) {
+		for (int dy = -1; dy <= 1; dy++) {
+			int eny = tiy + dy;
+			if (eny < 0 || eny >= field_gh) continue;
+			for (int dx = -1; dx <= 1; dx++) {
+				if (dx == 0 && dy == 0) continue;
+				int enx = tix + dx;
+				if (enx < 0 || enx >= field_gw) continue;
+				int eci = eny * field_gw + enx;
+				uint ca = cell_attacker[eci];
+				if (ca != 0xFFFFFFFFu && ca < uint(agent_count)) {
+					uint ca_info = agent_info[ca];
+					if ((ca_info & 1u) != 0u && (ca_info & (1u << 9u)) != 0u) {
+						uint ca_group = fac_to_group[(ca_info >> 1u) & 0x1Fu];
+						if (ca_group == group) {
+							wpx -= float(dx);
+							wpy -= float(dy);
+						}
+					}
+				}
+			}
+		}
+	}
+
 	float wall_repel = 40.0;
 	vfx += wpx * wall_repel;
 	vfy += wpy * wall_repel;
@@ -175,8 +219,15 @@ void main() {
 	vx += (vfx + vsx - vx) * blend;
 	vy += (vfy + vsy - vy) * blend;
 
-	// --- attack freeze ---
+	if (atk_impede > 0.0 && (info & (1u << 9u)) == 0u) {
+		float slow = 1.0 - atk_impede * 0.7;
+		vx *= slow;
+		vy *= slow;
+	}
+
+	// --- attack freeze (displaced agents keep moving) ---
 	bool is_attacking = (info & (1u << 9u)) != 0u;
+	bool is_displaced = (info & (1u << 10u)) != 0u;
 	if (is_attacking) {
 		vx = 0.0; vy = 0.0;
 	}
@@ -284,14 +335,19 @@ void main() {
 					uint j_group  = fac_to_group[(j2_info >> 1u) & 0x1Fu];
 					bool same_team = (group == j_group);
 
-					if (i_attacking) {
-						if (!j_atk) continue;
-					} else {
-						if (same_team && j_atk) continue;
-					}
+				if (i_attacking) {
+					if (!j_atk) continue;
+					bool j_disp = (j2_info & (1u << 10u)) != 0u;
+					if (!is_displaced && j_disp) continue;
+					if (is_displaced && same_team) continue;
+				}
 
 					float ed, push_frac;
 					if (i_attacking) {
+						ed = full_dist;  push_frac = 0.5;
+					} else if (j_atk && !same_team) {
+						ed = full_dist * 1.5;  push_frac = 1.0;
+					} else if (j_atk) {
 						ed = full_dist;  push_frac = 0.5;
 					} else if (!same_team) {
 						ed = full_dist;  push_frac = 1.0;
@@ -328,11 +384,105 @@ void main() {
 		}
 	}
 
-	// Snap attacking agents to cell center as the absolute final step
+	// --- cell conflict resolution for attacking agents ---
 	if (is_attacking) {
-		npx = (floor(npx * ifc) + 0.5) * field_cs;
-		npy = (floor(npy * ifc) + 0.5) * field_cs;
+		int atk_cx = clamp(int(npx * ifc), 0, field_gw - 1);
+		int atk_cy = clamp(int(npy * ifc), 0, field_gh - 1);
+		int atk_ci = atk_cy * field_gw + atk_cx;
+
+		uint prev = atomicCompSwap(cell_attacker[atk_ci], 0xFFFFFFFFu, i);
+
+		if (prev == 0xFFFFFFFFu || prev == i) {
+			if (is_displaced) {
+				agent_info[i] = info & ~(1u << 10u);
+				cooldown_buf[i] = 0.0;
+			}
+			float tgt_x = (float(atk_cx) + 0.5) * field_cs;
+			float tgt_y = (float(atk_cy) + 0.5) * field_cs;
+			float smx = tgt_x - npx;
+			float smy = tgt_y - npy;
+			float smd = sqrt(smx * smx + smy * smy);
+		if (smd > 0.1) {
+			float sstep = min(80.0 * dt, smd);
+			npx += (smx / smd) * sstep;
+			npy += (smy / smd) * sstep;
+			} else {
+				npx = tgt_x;
+				npy = tgt_y;
+			}
+		} else {
+			if (!is_displaced) {
+				agent_info[i] = info | (1u << 10u);
+			}
+
+			float best_dd = 1e10;
+			int best_nx = atk_cx, best_ny = atk_cy;
+			bool found_cell = false;
+			for (int sr = 1; sr <= 5 && !found_cell; sr++) {
+				for (int dy = -sr; dy <= sr; dy++) {
+					for (int dx = -sr; dx <= sr; dx++) {
+						if (max(abs(dx), abs(dy)) != sr) continue;
+						int enx = atk_cx + dx;
+						int eny = atk_cy + dy;
+						if (enx < 0 || enx >= field_gw || eny < 0 || eny >= field_gh) continue;
+						if (terrain[eny * field_gw + enx] > 0.5) continue;
+						int eci = eny * field_gw + enx;
+						uint ecv = cell_attacker[eci];
+						if (ecv != 0xFFFFFFFFu && ecv != i) continue;
+						float ecx = (float(enx) + 0.5) * field_cs;
+						float ecy = (float(eny) + 0.5) * field_cs;
+						float dd = (ecx - px) * (ecx - px) + (ecy - py) * (ecy - py);
+						if (dd < best_dd) {
+							best_dd = dd;
+							best_nx = enx;
+							best_ny = eny;
+							found_cell = true;
+						}
+					}
+				}
+			}
+
+			if (found_cell) {
+				float tx = (float(best_nx) + 0.5) * field_cs;
+				float ty = (float(best_ny) + 0.5) * field_cs;
+				float mx = tx - px;
+				float my = ty - py;
+				float md = sqrt(mx * mx + my * my);
+				float disp_speed = 120.0;
+				if (md > 0.01) {
+					float step = min(disp_speed * dt, md);
+					npx = px + (mx / md) * step;
+					npy = py + (my / md) * step;
+				}
+			} else {
+				float angle = rand01(i * 137u + 77u) * 6.28318;
+				float disp_speed = 120.0;
+				npx = px + cos(angle) * disp_speed * dt;
+				npy = py + sin(angle) * disp_speed * dt;
+			}
+
+			int check_gx = clamp(int(npx * ifc), 0, field_gw - 1);
+			int check_gy = clamp(int(npy * ifc), 0, field_gh - 1);
+			if (terrain[check_gy * field_gw + check_gx] > 0.5) {
+				npx = px;
+				npy = py;
+			}
+		}
 	}
+
+	if (is_attacking && !is_displaced) {
+		float max_disp = 80.0 * dt;
+		float ddx = npx - px;
+		float ddy = npy - py;
+		float ddd = sqrt(ddx * ddx + ddy * ddy);
+		if (ddd > max_disp) {
+			npx = px + (ddx / ddd) * max_disp;
+			npy = py + (ddy / ddd) * max_disp;
+		}
+	}
+
+	npx = clamp(npx, field_cs * 1.5, world_w - field_cs * 1.5);
+	npy = clamp(npy, field_cs * 1.5, world_h - field_cs * 1.5);
 
 	pos_x_out[i] = npx;  pos_y_out[i] = npy;
 	vel_x_out[i] = vx;   vel_y_out[i] = vy;

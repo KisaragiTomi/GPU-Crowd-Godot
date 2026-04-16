@@ -85,6 +85,18 @@ var goal_update_interval := 0.5
 var cached_info := PackedInt32Array()
 var cached_damage := PackedInt32Array()
 
+# Debug: jitter detection + per-frame log
+var _dbg_prev_pos: Dictionary = {}
+var _dbg_jitter_frames: Dictionary = {}
+var _dbg_jitter_log: Array = []
+var _dbg_jitter_agents: PackedInt32Array = PackedInt32Array()
+var _dbg_recording := false
+var _dbg_pre_buffer: Array = []
+const _DBG_MAX_FRAMES := 60
+const _DBG_PRE_FRAMES := 10
+const _DBG_JITTER_SPD := 3.0
+const _DBG_JITTER_TRIGGER := 3
+
 # HUD
 var hud_label: Label
 var slider_agents: HSlider
@@ -504,9 +516,11 @@ func _update_select_label() -> void:
 	var alive := cached_info.size() > idx and (cached_info[idx] & 1) != 0
 	var fac := 0
 	var is_atk := false
+	var is_disp := false
 	if cached_info.size() > idx:
 		fac = (cached_info[idx] >> 1) & 0x1F
 		is_atk = (cached_info[idx] & (1 << 9)) != 0
+		is_disp = (cached_info[idx] & (1 << 10)) != 0
 	var team := "A" if fac < NUM_FACTIONS / 2 else "B"
 	var dmg := 0
 	if cached_damage.size() > idx:
@@ -616,6 +630,7 @@ func _physics_process(dt: float) -> void:
 	# 8 — MultiMesh
 	_sync_multimesh()
 	_update_select_label()
+	_log_bow_frame(dt)
 
 	# 9 — Dynamic goal update
 	goal_update_timer += dt
@@ -934,6 +949,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_G:
 				show_goal = not show_goal
 				btn_goal.button_pressed = show_goal; queue_redraw()
+			KEY_L: _dump_jitter_log()
 			KEY_1: _set_brush(BrushMode.NONE)
 			KEY_2: _set_brush(BrushMode.WALL)
 			KEY_3: _set_brush(BrushMode.GOAL)
@@ -993,3 +1009,131 @@ func _set_brush(mode: BrushMode) -> void:
 	if lbl:
 		lbl.text = "Mode: %s | Radius: %d" % [_brush_name(), brush_radius]
 	queue_redraw()
+
+
+# ── Debug: jitter detection + per-frame logging ─────────────────────────
+
+func _collect_all_frame(dt: float) -> Dictionary:
+	var frame := {}
+	for id in range(agent_count):
+		if id >= cached_info.size():
+			break
+		var ainfo := cached_info[id]
+		if (ainfo & 1) == 0:
+			continue
+		var pos := agent_pos[id] if id < agent_pos.size() else Vector2.ZERO
+		var prev: Vector2 = _dbg_prev_pos.get(id, pos)
+		var eff_vel := (pos - prev) / maxf(dt, 0.001)
+		_dbg_prev_pos[id] = pos
+		frame[id] = {
+			"alive": true,
+			"px": pos.x, "py": pos.y,
+			"vx": eff_vel.x, "vy": eff_vel.y,
+			"spd": eff_vel.length(),
+			"atk": (ainfo & (1 << 9)) != 0,
+			"disp": (ainfo & (1 << 10)) != 0,
+			"fac": (ainfo >> 1) & 0x1F,
+			"dmg": cached_damage[id] if id < cached_damage.size() else 0,
+		}
+	return frame
+
+
+func _log_bow_frame(dt: float) -> void:
+	if cached_info.is_empty():
+		return
+
+	var cur_frame := _collect_all_frame(dt)
+
+	if not _dbg_recording:
+		# maintain pre-buffer
+		_dbg_pre_buffer.append(cur_frame)
+		if _dbg_pre_buffer.size() > _DBG_PRE_FRAMES:
+			_dbg_pre_buffer.pop_front()
+
+		# scan ATK agents for jitter
+		for id in cur_frame:
+			var d: Dictionary = cur_frame[id]
+			if not d.atk:
+				_dbg_jitter_frames.erase(id)
+				continue
+			if d.spd > _DBG_JITTER_SPD:
+				_dbg_jitter_frames[id] = _dbg_jitter_frames.get(id, 0) + 1
+			else:
+				_dbg_jitter_frames[id] = 0
+			if _dbg_jitter_frames[id] >= _DBG_JITTER_TRIGGER:
+				_start_jitter_recording(id)
+				break
+	else:
+		# recording phase: filter to tracked agents
+		var filtered := {}
+		for id in _dbg_jitter_agents:
+			if cur_frame.has(id):
+				filtered[id] = cur_frame[id]
+		_dbg_jitter_log.append(filtered)
+		if _dbg_jitter_log.size() >= _DBG_MAX_FRAMES:
+			_dump_jitter_log()
+			_dbg_recording = false
+			_dbg_jitter_log.clear()
+			_dbg_jitter_agents = PackedInt32Array()
+			_dbg_jitter_frames.clear()
+
+
+func _start_jitter_recording(trigger_id: int) -> void:
+	_dbg_recording = true
+
+	var ids: Array[int] = [trigger_id]
+	var trigger_pos := agent_pos[trigger_id] if trigger_id < agent_pos.size() else Vector2.ZERO
+
+	var neighbors: Array = []
+	for j in range(agent_count):
+		if j == trigger_id or j >= cached_info.size():
+			continue
+		if (cached_info[j] & 1) == 0:
+			continue
+		var d := agent_pos[j].distance_squared_to(trigger_pos)
+		neighbors.append({"id": j, "dsq": d})
+	neighbors.sort_custom(func(a, b): return a.dsq < b.dsq)
+	for k in range(mini(neighbors.size(), 14)):
+		ids.append(neighbors[k].id)
+
+	_dbg_jitter_agents = PackedInt32Array(ids)
+
+	# seed log with pre-buffer frames (filtered to tracked agents)
+	_dbg_jitter_log.clear()
+	for pf: Dictionary in _dbg_pre_buffer:
+		var filtered := {}
+		for id in _dbg_jitter_agents:
+			if pf.has(id):
+				filtered[id] = pf[id]
+		_dbg_jitter_log.append(filtered)
+	_dbg_pre_buffer.clear()
+
+	print("=== JITTER DETECTED: Agent #%d (spd>%.1f for %d+ frames) ===" % [
+		trigger_id, _DBG_JITTER_SPD, _DBG_JITTER_TRIGGER])
+	print("Recording %d frames (%d pre-buffered) for agents: %s" % [
+		_DBG_MAX_FRAMES, _dbg_jitter_log.size(), str(_dbg_jitter_agents)])
+
+
+func _dump_jitter_log() -> void:
+	if _dbg_jitter_log.is_empty():
+		print("No jitter log data.")
+		return
+	print("=== JITTER LOG (%d frames, tracking %s) ===" % [_dbg_jitter_log.size(), str(_dbg_jitter_agents)])
+	for f in range(_dbg_jitter_log.size()):
+		var fd: Dictionary = _dbg_jitter_log[f]
+		var parts := PackedStringArray()
+		for id in _dbg_jitter_agents:
+			if not fd.has(id):
+				continue
+			var d: Dictionary = fd[id]
+			if not d.alive:
+				parts.append("#%d DEAD" % id)
+				continue
+			var flags := ""
+			if d.atk: flags += "ATK "
+			if d.disp: flags += "DISP "
+			parts.append("#%d p=(%.1f,%.1f) v=(%.1f,%.1f) spd=%.1f %sdmg=%d" % [
+				id, d.px, d.py, d.vx, d.vy, d.spd, flags, d.dmg
+			])
+		print("F%02d: %s" % [f, " | ".join(parts)])
+	print("=== END JITTER LOG ===")

@@ -37,6 +37,7 @@ var buf_atk_damage: RID
 # Per-cell combat buffer
 var buf_faction_presence: RID
 var buf_corpse_map: RID
+var buf_cell_attacker: RID
 
 # Small tables (32 entries each)
 var buf_alliance: RID
@@ -176,6 +177,12 @@ func set_field_buffers(out_vx: RID, out_vy: RID, terrain: RID, goal_dist: RID,
 	ffc.fill(0xFF)
 	buf_corpse_map = rd.storage_buffer_create(_field_cell_count * 4, ffc)
 
+	# Cell attacker map: 0xFFFFFFFF = empty, agent index = attacker occupying cell
+	var fca := PackedByteArray()
+	fca.resize(_field_cell_count * 4)
+	fca.fill(0xFF)
+	buf_cell_attacker = rd.storage_buffer_create(_field_cell_count * 4, fca)
+
 
 func build_uniform_sets() -> void:
 	us_clear = rd.uniform_set_create([_u(0, buf_cell_count)], shd_clear, 0)
@@ -205,6 +212,7 @@ func build_uniform_sets() -> void:
 			_u(2, buf_cell_start), _u(3, buf_cell_count),
 			_u(4, buf_sorted_idx), _u(5, _buf_density),
 			_u(6, buf_agent_info), _u(7, buf_faction_presence),
+			_u(8, buf_cell_attacker),
 		], shd_density, 0)
 
 		us_combat[b] = rd.uniform_set_create([
@@ -237,6 +245,8 @@ func build_uniform_sets() -> void:
 		_u(2, _buf_out_vy),
 		_u(3, buf_fac_to_group),
 		_u(4, buf_corpse_map),
+		_u(5, buf_cell_attacker),
+		_u(6, buf_cooldown),
 	], shd_steer, 1)
 
 
@@ -462,6 +472,7 @@ func cleanup() -> void:
 	for rid in [buf_cell_count, buf_cell_start, buf_cell_offset, buf_sorted_idx,
 				buf_stall, buf_agent_info, buf_damage_acc, buf_max_hp,
 				buf_regen_rate, buf_cooldown, buf_atk_range, buf_atk_damage,
-				buf_faction_presence, buf_corpse_map, buf_alliance, buf_fac_to_group]:
+				buf_faction_presence, buf_corpse_map, buf_cell_attacker,
+				buf_alliance, buf_fac_to_group]:
 		rd.free_rid(rid)
 	rd = null
