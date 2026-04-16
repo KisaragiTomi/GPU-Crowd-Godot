@@ -455,10 +455,16 @@ void main() {
 					npy = py + (my / md) * step;
 				}
 			} else {
-				float angle = rand01(i * 137u + 77u) * 6.28318;
+				float sep_d = sqrt(vsx * vsx + vsy * vsy);
 				float disp_speed = 120.0;
-				npx = px + cos(angle) * disp_speed * dt;
-				npy = py + sin(angle) * disp_speed * dt;
+				if (sep_d > 0.1) {
+					npx = px + (vsx / sep_d) * disp_speed * dt;
+					npy = py + (vsy / sep_d) * disp_speed * dt;
+				} else {
+					float angle = rand01(i * 137u + 77u) * 6.28318;
+					npx = px + cos(angle) * disp_speed * dt;
+					npy = py + sin(angle) * disp_speed * dt;
+				}
 			}
 
 			int check_gx = clamp(int(npx * ifc), 0, field_gw - 1);
