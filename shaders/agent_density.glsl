@@ -53,7 +53,7 @@ void main() {
 				presence |= (1u << afac);
 
 				float weight = 1.0;
-				if ((ainfo & (1u << 9u)) != 0u) weight = 5.0;
+				if ((ainfo & (1u << 9u)) != 0u) weight = 0.0;
 
 				float gx = pos_x[aid] * ifc;
 				float gy = pos_y[aid] * ifc;
@@ -72,5 +72,4 @@ void main() {
 	int gi = fy * field_gw + fx;
 	density_out[gi] = d;
 	faction_presence_out[gi] = presence;
-	cell_attacker_out[gi] = 0xFFFFFFFFu;
 }

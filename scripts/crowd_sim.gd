@@ -31,6 +31,10 @@ var agents: GPUAgents
 
 var agent_pos: PackedVector2Array
 var agent_vel: PackedVector2Array
+var display_pos: PackedVector2Array
+var _pos_buf: Array[PackedVector2Array] = []
+var _pos_buf_idx := 0
+const POS_BUF_FRAMES := 3
 
 var world_size: Vector2
 var wall_cells: PackedVector2Array
@@ -84,6 +88,8 @@ var goal_update_timer := 0.0
 var goal_update_interval := 0.5
 var cached_info := PackedInt32Array()
 var cached_damage := PackedInt32Array()
+var cached_cell_atk := PackedInt32Array()
+var cached_cell_blocked := PackedInt32Array()
 
 # Debug: jitter detection + per-frame log
 var _dbg_prev_pos: Dictionary = {}
@@ -94,8 +100,21 @@ var _dbg_recording := false
 var _dbg_pre_buffer: Array = []
 const _DBG_MAX_FRAMES := 60
 const _DBG_PRE_FRAMES := 10
-const _DBG_JITTER_SPD := 3.0
+const _DBG_JITTER_SPD := 65.0
 const _DBG_JITTER_TRIGGER := 3
+var _dbg_jitter_marked: Dictionary = {}
+var _dbg_cross_timer := 0
+const _DBG_CROSS_INTERVAL := 30
+const _DBG_CROSS_DIST := 16.0
+
+# DISP persistence monitor
+var _dbg_disp_frames: Dictionary = {}
+const _DBG_DISP_TRIGGER := 120
+var _dbg_disp_recording := false
+var _dbg_auto_pause_done := true
+var _dbg_disp_log: Array = []
+var _dbg_disp_agent := -1
+const _DBG_DISP_LOG_FRAMES := 120
 
 # HUD
 var hud_label: Label
@@ -137,7 +156,7 @@ func _ready() -> void:
 		field.buf_terrain, field.buf_goal_dist,
 		field.buf_density,
 		grid_width, grid_height, cell_size,
-		field.buf_goal_dist_all
+		field.buf_goal_dist_all, NUM_GOAL_GROUPS
 	)
 	agents.build_uniform_sets()
 
@@ -282,6 +301,12 @@ func _spawn_agents() -> void:
 	var half := NUM_FACTIONS / 2
 	agent_pos = PackedVector2Array(); agent_pos.resize(agent_count)
 	agent_vel = PackedVector2Array(); agent_vel.resize(agent_count)
+	display_pos = PackedVector2Array(); display_pos.resize(agent_count)
+	_pos_buf.clear()
+	for _f in range(POS_BUF_FRAMES):
+		var buf := PackedVector2Array(); buf.resize(agent_count)
+		_pos_buf.append(buf)
+	_pos_buf_idx = 0
 	agent_equips = []
 	agent_factions = PackedInt32Array(); agent_factions.resize(agent_count)
 
@@ -305,6 +330,9 @@ func _spawn_agents() -> void:
 				randf_range(world_size.x * 0.7, world_size.x - cell_size * 3.0),
 				randf_range(cell_size * 3.0, world_size.y - cell_size * 3.0))
 		agent_vel[i] = Vector2.ZERO
+		display_pos[i] = agent_pos[i]
+		for f in range(POS_BUF_FRAMES):
+			_pos_buf[f][i] = agent_pos[i]
 
 		# Equipment
 		var equips: Array = []
@@ -472,9 +500,24 @@ func _make_circle_texture(radius_px: int) -> ImageTexture:
 	return ImageTexture.create_from_image(img)
 
 
+func _update_display_pos(_dt: float) -> void:
+	var cur := _pos_buf[_pos_buf_idx]
+	for i in range(agent_count):
+		cur[i] = agent_pos[i]
+	_pos_buf_idx = (_pos_buf_idx + 1) % POS_BUF_FRAMES
+	var inv := 1.0 / float(POS_BUF_FRAMES)
+	for i in range(agent_count):
+		var avg := Vector2.ZERO
+		for f in range(POS_BUF_FRAMES):
+			avg += _pos_buf[f][i]
+		display_pos[i] = avg * inv
+
+
 func _sync_multimesh() -> void:
 	cached_info = agents.readback_agent_info()
 	cached_damage = agents.readback_damage_acc()
+	cached_cell_atk = agents.readback_cell_attacker()
+	cached_cell_blocked = agents.readback_cell_blocked()
 	alive_count = 0
 	for i in range(agent_count):
 		var ainfo := cached_info[i]
@@ -483,12 +526,27 @@ func _sync_multimesh() -> void:
 			var hp_frac := 1.0 - clampf(float(cached_damage[i]) / maxf(float(cpu_max_hp[i]), 1.0), 0.0, 1.0)
 			var brightness := lerpf(0.2, 1.0, hp_frac)
 			var base_col := faction_colors[fac]
-			multi_mesh.set_instance_color(i, Color(base_col.r * brightness, base_col.g * brightness, base_col.b * brightness))
-			multi_mesh.set_instance_transform_2d(i, Transform2D(0.0, agent_pos[i]))
+			if _dbg_jitter_marked.has(i):
+				multi_mesh.set_instance_color(i, Color.WHITE)
+			else:
+				multi_mesh.set_instance_color(i, Color(base_col.r * brightness, base_col.g * brightness, base_col.b * brightness))
+			multi_mesh.set_instance_transform_2d(i, Transform2D(0.0, display_pos[i]))
 			alive_count += 1
 		else:
 			multi_mesh.set_instance_transform_2d(i, Transform2D(0.0, Vector2(-10000, -10000)))
 			multi_mesh.set_instance_color(i, Color.TRANSPARENT)
+
+	if not _dbg_auto_pause_done:
+		for j in range(agent_count):
+			if j >= cached_info.size(): break
+			var aj := cached_info[j]
+			if (aj & 1) != 0 and (aj & (1 << 10)) != 0:
+				selected_agent = j
+				_dbg_auto_pause_done = true
+				print("=== AUTO SELECT: DISP Agent #%d ===" % j)
+				paused = true
+				queue_redraw()
+				break
 
 
 func _pick_agent(world_pos: Vector2) -> void:
@@ -614,6 +672,14 @@ func _physics_process(dt: float) -> void:
 	agents.dispatch_combat(cl, dt, engage_range, attack_cd_base)
 	rd.compute_list_add_barrier(cl)
 
+	# 5.5 — Cell blocked map (per-group blockage bitmask)
+	agents.dispatch_cell_blocked(cl)
+	rd.compute_list_add_barrier(cl)
+
+	# 5.6 — DISP flow field (escape direction for displaced agents)
+	agents.dispatch_disp_flow(cl, NUM_GOAL_GROUPS)
+	rd.compute_list_add_barrier(cl)
+
 	# 6 — Agent steer + integrate
 	agents.dispatch_steer(cl, dt, separation_radius, separation_strength,
 						  steering_responsiveness, world_size.x, world_size.y)
@@ -625,6 +691,7 @@ func _physics_process(dt: float) -> void:
 
 	# 7 — Readback
 	agent_pos = agents.readback_positions()
+	_update_display_pos(dt)
 	var t2 := Time.get_ticks_usec()
 
 	# 8 — MultiMesh
@@ -897,20 +964,52 @@ func _draw() -> void:
 				draw_rect(Rect2(x * cs_val, y * cs_val, cs_val, cs_val),
 						  Color(0.05, t * 0.5, t * 0.35, 0.35))
 
-	if selected_agent >= 0 and selected_agent < agent_pos.size():
-		var sel_pos := agent_pos[selected_agent]
+	if selected_agent >= 0 and selected_agent < display_pos.size():
+		var sel_pos := display_pos[selected_agent]
 		var sel_alive := cached_info.size() > selected_agent and (cached_info[selected_agent] & 1) != 0
 		var sel_col := Color(1.0, 1.0, 0.2, 0.8) if sel_alive else Color(1.0, 0.3, 0.3, 0.6)
+
+		var sel_info := cached_info[selected_agent] if selected_agent < cached_info.size() else 0
+		var sel_fac := (sel_info >> 1) & 0x1F
+		var sel_grp := faction_to_group[sel_fac] if sel_fac < faction_to_group.size() else 0
+		var grp_bit := 1 << sel_grp
+
+		if cached_cell_blocked.size() > 0:
+			var total_cells := grid_width * grid_height
+			for ci in range(mini(total_cells, cached_cell_blocked.size())):
+				var cb := cached_cell_blocked[ci]
+				if cb == -1:
+					continue
+				if (cb & grp_bit) == 0:
+					continue
+				var cx := ci % grid_width
+				var cy := ci / grid_width
+				draw_rect(Rect2(cx * cs_val, cy * cs_val, cs_val, cs_val),
+						  Color(1.0, 0.2, 0.2, 0.35))
+
 		draw_arc(sel_pos, agent_radius * 2.5, 0, TAU, 32, sel_col, 2.0)
 		draw_arc(sel_pos, agent_radius * 3.5, 0, TAU, 32, Color(sel_col.r, sel_col.g, sel_col.b, 0.3), 1.0)
 		if selected_agent < cpu_atk_range.size():
 			var rng := cpu_atk_range[selected_agent]
 			if rng > 0.0:
 				draw_arc(sel_pos, rng, 0, TAU, 64, Color(1.0, 0.4, 0.2, 0.5), 1.5)
-		if nearest_enemy >= 0 and nearest_enemy < agent_pos.size():
-			var ne_pos := agent_pos[nearest_enemy]
+		if nearest_enemy >= 0 and nearest_enemy < display_pos.size():
+			var ne_pos := display_pos[nearest_enemy]
 			draw_line(sel_pos, ne_pos, Color(1.0, 0.2, 0.2, 0.7), 1.5)
 			draw_arc(ne_pos, agent_radius * 2.0, 0, TAU, 24, Color(1.0, 0.2, 0.2, 0.8), 2.0)
+
+		var sel_is_disp := (sel_info & (1 << 10)) != 0
+		if sel_is_disp and cached_cell_atk.size() > 0:
+			var sel_cx := clampi(int(agent_pos[selected_agent].x / cell_size), 0, grid_width - 1)
+			var sel_cy := clampi(int(agent_pos[selected_agent].y / cell_size), 0, grid_height - 1)
+			var ci := sel_cy * grid_width + sel_cx
+			var blocker := cached_cell_atk[ci] if ci < cached_cell_atk.size() else -1
+			draw_rect(Rect2(sel_cx * cs_val, sel_cy * cs_val, cs_val, cs_val),
+					  Color(1.0, 0.5, 0.0, 0.5))
+			if blocker >= 0 and blocker != selected_agent and blocker < display_pos.size():
+				var bpos := display_pos[blocker]
+				draw_line(sel_pos, bpos, Color(1.0, 0.6, 0.0, 0.8), 2.0)
+				draw_arc(bpos, agent_radius * 2.0, 0, TAU, 24, Color(1.0, 0.6, 0.0, 0.9), 2.0)
 
 	if brush_mode != BrushMode.NONE:
 		var mpos := get_global_mouse_position()
@@ -1021,7 +1120,7 @@ func _collect_all_frame(dt: float) -> Dictionary:
 		var ainfo := cached_info[id]
 		if (ainfo & 1) == 0:
 			continue
-		var pos := agent_pos[id] if id < agent_pos.size() else Vector2.ZERO
+		var pos := display_pos[id] if id < display_pos.size() else Vector2.ZERO
 		var prev: Vector2 = _dbg_prev_pos.get(id, pos)
 		var eff_vel := (pos - prev) / maxf(dt, 0.001)
 		_dbg_prev_pos[id] = pos
@@ -1050,7 +1149,10 @@ func _log_bow_frame(dt: float) -> void:
 		if _dbg_pre_buffer.size() > _DBG_PRE_FRAMES:
 			_dbg_pre_buffer.pop_front()
 
-		# scan ATK agents for jitter
+		_check_crossing(cur_frame)
+
+		# scan ATK agents for jitter + visual marking
+		_dbg_jitter_marked.clear()
 		for id in cur_frame:
 			var d: Dictionary = cur_frame[id]
 			if not d.atk:
@@ -1061,8 +1163,47 @@ func _log_bow_frame(dt: float) -> void:
 			else:
 				_dbg_jitter_frames[id] = 0
 			if _dbg_jitter_frames[id] >= _DBG_JITTER_TRIGGER:
-				_start_jitter_recording(id)
-				break
+				_dbg_jitter_marked[id] = true
+				if not _dbg_recording:
+					_start_jitter_recording(id)
+
+		# DISP persistence monitor
+		if not _dbg_disp_recording:
+			for id2 in cur_frame:
+				var d2: Dictionary = cur_frame[id2]
+				if d2.disp:
+					_dbg_disp_frames[id2] = _dbg_disp_frames.get(id2, 0) + 1
+				else:
+					_dbg_disp_frames.erase(id2)
+				if _dbg_disp_frames.get(id2, 0) >= _DBG_DISP_TRIGGER:
+					_dbg_disp_recording = true
+					_dbg_disp_agent = id2
+					_dbg_disp_log.clear()
+					print("=== LONG DISP: Agent #%d stuck for %d+ frames ===" % [id2, _DBG_DISP_TRIGGER])
+					break
+		else:
+			if cur_frame.has(_dbg_disp_agent):
+				var dd: Dictionary = cur_frame[_dbg_disp_agent]
+				var cx := clampi(int(dd.px / cell_size), 0, grid_width - 1)
+				var cy := clampi(int(dd.py / cell_size), 0, grid_height - 1)
+				var ci := cy * grid_width + cx
+				var blocker := cached_cell_atk[ci] if ci < cached_cell_atk.size() else -1
+				_dbg_disp_log.append({
+					"px": dd.px, "py": dd.py, "vx": dd.vx, "vy": dd.vy,
+					"spd": dd.spd, "cell": Vector2i(cx, cy), "blocker": blocker,
+					"disp": dd.disp, "atk": dd.atk
+				})
+			else:
+				print("=== DISP LOG: Agent #%d lost (died/despawned) during recording ===" % _dbg_disp_agent)
+				_dump_disp_log()
+				_dbg_disp_recording = false
+				_dbg_disp_frames.erase(_dbg_disp_agent)
+				_dbg_disp_agent = -1
+			if _dbg_disp_log.size() >= _DBG_DISP_LOG_FRAMES:
+				_dump_disp_log()
+				_dbg_disp_recording = false
+				_dbg_disp_frames.erase(_dbg_disp_agent)
+				_dbg_disp_agent = -1
 	else:
 		# recording phase: filter to tracked agents
 		var filtered := {}
@@ -1076,6 +1217,60 @@ func _log_bow_frame(dt: float) -> void:
 			_dbg_jitter_log.clear()
 			_dbg_jitter_agents = PackedInt32Array()
 			_dbg_jitter_frames.clear()
+
+
+func _dump_disp_log() -> void:
+	if _dbg_disp_log.is_empty():
+		return
+	print("=== DISP LOG (Agent #%d, %d frames) ===" % [_dbg_disp_agent, _dbg_disp_log.size()])
+	for f in range(_dbg_disp_log.size()):
+		var d: Dictionary = _dbg_disp_log[f]
+		var flags := ""
+		if d.atk: flags += "ATK "
+		if d.disp: flags += "DISP "
+		print("F%02d: p=(%.1f,%.1f) v=(%.1f,%.1f) spd=%.1f cell=(%d,%d) blocker=#%d %s" % [
+			f, d.px, d.py, d.vx, d.vy, d.spd,
+			d.cell.x, d.cell.y, d.blocker, flags])
+	print("=== END DISP LOG ===")
+	_dbg_disp_log.clear()
+
+
+func _check_crossing(cur_frame: Dictionary) -> void:
+	_dbg_cross_timer += 1
+	if _dbg_cross_timer < _DBG_CROSS_INTERVAL:
+		return
+	_dbg_cross_timer = 0
+	var half := NUM_FACTIONS / 2
+	var atk_list: Array[int] = []
+	var non_atk_list: Array[int] = []
+	for id in cur_frame:
+		var d: Dictionary = cur_frame[id]
+		if d.atk:
+			atk_list.append(id)
+		else:
+			non_atk_list.append(id)
+	var cross_count := 0
+	var examples: Array[String] = []
+	var dsq_thresh := _DBG_CROSS_DIST * _DBG_CROSS_DIST
+	for na in non_atk_list:
+		var nd: Dictionary = cur_frame[na]
+		var na_side := 0 if nd.fac < half else 1
+		var na_pos := Vector2(nd.px, nd.py)
+		for atk in atk_list:
+			var ad: Dictionary = cur_frame[atk]
+			var atk_side := 0 if ad.fac < half else 1
+			if na_side == atk_side:
+				continue
+			var dsq := na_pos.distance_squared_to(Vector2(ad.px, ad.py))
+			if dsq < dsq_thresh:
+				cross_count += 1
+				if examples.size() < 3:
+					examples.append("#%d(f%d) near enemy ATK #%d(f%d) d=%.1f" % [na, nd.fac, atk, ad.fac, sqrt(dsq)])
+				break
+	if cross_count > 0:
+		print("=== CROSS DETECTED: %d non-ATK within %.0fpx of enemy ATK ===" % [cross_count, _DBG_CROSS_DIST])
+		for e in examples:
+			print("  ", e)
 
 
 func _start_jitter_recording(trigger_id: int) -> void:
