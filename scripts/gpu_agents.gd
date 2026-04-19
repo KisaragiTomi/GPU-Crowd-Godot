@@ -290,6 +290,8 @@ func build_uniform_sets() -> void:
 		_u(3, buf_disp_vx),
 		_u(4, buf_disp_vy),
 		_u(5, buf_cell_attacker),
+		_u(6, buf_faction_presence),
+		_u(7, buf_fac_to_group),
 	], shd_disp_flow, 0)
 
 
@@ -450,12 +452,12 @@ func dispatch_cell_blocked(cl: int) -> void:
 	rd.compute_list_dispatch(cl, ceili(float(_field_gw) / 8.0), ceili(float(_field_gh) / 8.0), 1)
 
 
-func dispatch_disp_flow(cl: int, num_groups: int) -> void:
+func dispatch_disp_flow(cl: int, num_groups: int, num_factions: int) -> void:
 	var p := PackedByteArray(); p.resize(16)
 	p.encode_s32(0, _field_gw)
 	p.encode_s32(4, _field_gh)
 	p.encode_s32(8, num_groups)
-	p.encode_s32(12, 0)
+	p.encode_s32(12, num_factions)
 	rd.compute_list_bind_compute_pipeline(cl, pip_disp_flow)
 	rd.compute_list_bind_uniform_set(cl, us_disp_flow, 0)
 	rd.compute_list_set_push_constant(cl, p, 16)
@@ -532,25 +534,28 @@ func _zero_bytes(count: int) -> PackedByteArray:
 func cleanup() -> void:
 	if rd == null:
 		return
+	var _free := func(rid: RID) -> void:
+		if rid.is_valid():
+			rd.free_rid(rid)
 	for rid in [us_clear, us_prefix, us_steer_s1, us_cell_blocked, us_disp_flow]:
-		rd.free_rid(rid)
+		_free.call(rid)
 	for arr in [us_count, us_scatter, us_density, us_steer, us_combat]:
 		for rid in arr:
-			rd.free_rid(rid)
+			_free.call(rid)
 	for pip in [pip_clear, pip_count, pip_prefix, pip_scatter,
 				pip_density, pip_steer, pip_combat, pip_cell_blocked, pip_disp_flow]:
-		rd.free_rid(pip)
+		_free.call(pip)
 	for shd in [shd_clear, shd_count, shd_prefix, shd_scatter,
 				shd_density, shd_steer, shd_combat, shd_cell_blocked, shd_disp_flow]:
-		rd.free_rid(shd)
+		_free.call(shd)
 	for arr in [buf_pos_x, buf_pos_y, buf_vel_x, buf_vel_y]:
 		for rid in arr:
-			rd.free_rid(rid)
+			_free.call(rid)
 	for rid in [buf_cell_count, buf_cell_start, buf_cell_offset, buf_sorted_idx,
 				buf_stall, buf_agent_info, buf_damage_acc, buf_max_hp,
 				buf_regen_rate, buf_cooldown, buf_atk_range, buf_atk_damage,
 				buf_faction_presence, buf_corpse_map, buf_cell_attacker,
 				buf_cell_blocked, buf_disp_vx, buf_disp_vy,
 				buf_alliance, buf_fac_to_group]:
-		rd.free_rid(rid)
+		_free.call(rid)
 	rd = null

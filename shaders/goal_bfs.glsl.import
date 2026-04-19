@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://s237x2f2q4g6"
+path="res://.godot/imported/goal_bfs.glsl-20c9183425815488b71d3cce10131693.res"
+
+[deps]
+
+source_file="res://shaders/goal_bfs.glsl"
+dest_files=["res://.godot/imported/goal_bfs.glsl-20c9183425815488b71d3cce10131693.res"]
+
+[params]
+

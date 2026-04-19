@@ -425,62 +425,23 @@ void main() {
 				dy /= dlen;
 			}
 
-			int pgx = clamp(int((px + dx * field_cs) * ifc), 0, field_gw - 1);
-			int pgy = clamp(int((py + dy * field_cs) * ifc), 0, field_gh - 1);
-			int pci = pgy * field_gw + pgx;
-			bool blocked = (cell_attacker[pci] != 0xFFFFFFFFu) || (terrain[pci] > 0.5);
-			if (blocked) {
-				float ndx = -dy, ndy = dx;
-				pgx = clamp(int((px + ndx * field_cs) * ifc), 0, field_gw - 1);
-				pgy = clamp(int((py + ndy * field_cs) * ifc), 0, field_gh - 1);
-				pci = pgy * field_gw + pgx;
-				bool ok1 = (cell_attacker[pci] == 0xFFFFFFFFu) && (terrain[pci] <= 0.5);
-				if (ok1) {
-					dx = ndx; dy = ndy;
-				} else {
-					ndx = dy; ndy = -dx;
-					pgx = clamp(int((px + ndx * field_cs) * ifc), 0, field_gw - 1);
-					pgy = clamp(int((py + ndy * field_cs) * ifc), 0, field_gh - 1);
-					pci = pgy * field_gw + pgx;
-					bool ok2 = (cell_attacker[pci] == 0xFFFFFFFFu) && (terrain[pci] <= 0.5);
-					if (ok2) {
-						dx = ndx; dy = ndy;
-					}
-					// all directions blocked: keep original disp_flow direction
-				}
-			}
-
-			float esep_d = sqrt(esep_x * esep_x + esep_y * esep_y);
-			float blend_e = clamp(esep_d * 2.0, 0.0, 1.0);
-			float mx = mix(dx, esep_x / max(esep_d, 0.01), blend_e);
-			float my = mix(dy, esep_y / max(esep_d, 0.01), blend_e);
-			float mlen = sqrt(mx * mx + my * my);
-			if (mlen > 0.01) { mx /= mlen; my /= mlen; }
-
-			float tsep_x = vsx - esep_x;
-			float tsep_y = vsy - esep_y;
-			float tsep_dot = tsep_x * mx + tsep_y * my;
-			float tsep_par = max(tsep_dot, 0.0);
-			float tsep_fx = (tsep_x - tsep_dot * mx) + tsep_par * mx;
-			float tsep_fy = (tsep_y - tsep_dot * my) + tsep_par * my;
-
-			npx = px + mx * disp_speed * dt + tsep_fx * 3.0 * dt;
-			npy = py + my * disp_speed * dt + tsep_fy * 3.0 * dt;
+			npx = px + dx * disp_speed * dt;
+			npy = py + dy * disp_speed * dt;
 
 			int check_gx = clamp(int(npx * ifc), 0, field_gw - 1);
 			int check_gy = clamp(int(npy * ifc), 0, field_gh - 1);
 			if (terrain[check_gy * field_gw + check_gx] > 0.5) {
 				bool resolved = false;
-				if (abs(mx) > 0.001 && !resolved) {
-					float sx = px + sign(mx) * disp_speed * dt;
+				if (abs(dx) > 0.001 && !resolved) {
+					float sx = px + sign(dx) * disp_speed * dt;
 					int sgx = clamp(int(sx * ifc), 0, field_gw - 1);
 					int sgy = clamp(int(py * ifc), 0, field_gh - 1);
 					if (terrain[sgy * field_gw + sgx] <= 0.5) {
 						npx = sx; npy = py; resolved = true;
 					}
 				}
-				if (abs(my) > 0.001 && !resolved) {
-					float sy = py + sign(my) * disp_speed * dt;
+				if (abs(dy) > 0.001 && !resolved) {
+					float sy = py + sign(dy) * disp_speed * dt;
 					int sgx = clamp(int(px * ifc), 0, field_gw - 1);
 					int sgy = clamp(int(sy * ifc), 0, field_gh - 1);
 					if (terrain[sgy * field_gw + sgx] <= 0.5) {

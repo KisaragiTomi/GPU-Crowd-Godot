@@ -42,11 +42,15 @@ var buf_gdir_x: RID
 var buf_gdir_y: RID
 var buf_out_vx: RID
 var buf_out_vy: RID
+var buf_bfs_dist: RID
+var uset_bfs: RID
 
 var shader_flux: RID
 var shader_vel: RID
+var shader_bfs: RID
 var pipeline_flux: RID
 var pipeline_vel: RID
+var pipeline_bfs: RID
 var uset_flux: RID
 var uset_vel: RID
 
@@ -99,17 +103,22 @@ func build_goal_field(goals: Array[Vector2i]) -> void:
 
 func build_all_goal_fields(group_goals: Array) -> void:
 	goal_dist_all.fill(1e6)
+	for g in range(mini(group_goals.size(), max_groups)):
+		build_goal_field_group(g, group_goals[g])
+
+
+func build_goal_field_group(group: int, goals) -> void:
 	var tmp := PackedFloat32Array()
 	tmp.resize(cell_count)
-	for g in range(mini(group_goals.size(), max_groups)):
-		tmp.fill(1e6)
-		_bfs_into(tmp, group_goals[g])
-		var off := g * cell_count
-		for i in range(cell_count):
-			goal_dist_all[off + i] = tmp[i]
-		_compute_gradient_for(tmp, g)
+	tmp.fill(1e6)
+	_bfs_into(tmp, goals)
+	var off := group * cell_count
 	for i in range(cell_count):
-		goal_dist[i] = goal_dist_all[i]
+		goal_dist_all[off + i] = tmp[i]
+	_compute_gradient_for(tmp, group)
+	if group == 0:
+		for i in range(cell_count):
+			goal_dist[i] = tmp[i]
 
 
 func _bfs_into(dist: PackedFloat32Array, goals) -> void:
@@ -222,6 +231,15 @@ func _init_gpu() -> void:
 	shader_vel   = rd.shader_create_from_spirv(vel_spirv)
 	pipeline_vel = rd.compute_pipeline_create(shader_vel)
 
+	var bfs_spirv := (load("res://shaders/goal_bfs.glsl") as RDShaderFile).get_spirv()
+	shader_bfs   = rd.shader_create_from_spirv(bfs_spirv)
+	pipeline_bfs = rd.compute_pipeline_create(shader_bfs)
+
+	var zb_uint := PackedByteArray()
+	zb_uint.resize(cell_count * 4)
+	zb_uint.fill(0xFF)
+	buf_bfs_dist = rd.storage_buffer_create(cell_count * 4, zb_uint)
+
 	_build_uniform_sets()
 
 
@@ -248,8 +266,62 @@ func _ubuf(binding: int, buf: RID) -> RDUniform:
 
 # ── Static data upload ──────────────────────────────────────────────────
 
+func setup_bfs(faction_presence: RID, fac_to_group: RID) -> void:
+	uset_bfs = rd.uniform_set_create([
+		_ubuf(0, faction_presence),
+		_ubuf(1, buf_terrain),
+		_ubuf(2, fac_to_group),
+		_ubuf(3, buf_bfs_dist),
+		_ubuf(4, buf_goal_dist_all),
+		_ubuf(5, buf_goal_dist),
+		_ubuf(6, buf_gdir_x),
+		_ubuf(7, buf_gdir_y),
+	], shader_bfs, 0)
+
+
+const BFS_RELAX_ITERS := 256
+
+func dispatch_goal_bfs(cl: int, target_group: int, num_factions: int) -> void:
+	var gx := ceili(float(gw) / 8.0)
+	var gy := ceili(float(gh) / 8.0)
+	var p := PackedByteArray(); p.resize(32)
+	p.encode_s32(0, gw)
+	p.encode_s32(4, gh)
+	p.encode_s32(12, target_group)
+	p.encode_s32(16, num_factions)
+
+	# INIT
+	p.encode_s32(8, 0)
+	rd.compute_list_bind_compute_pipeline(cl, pipeline_bfs)
+	rd.compute_list_bind_uniform_set(cl, uset_bfs, 0)
+	rd.compute_list_set_push_constant(cl, p, 32)
+	rd.compute_list_dispatch(cl, gx, gy, 1)
+	rd.compute_list_add_barrier(cl)
+
+	# RELAX iterations
+	p.encode_s32(8, 1)
+	for _i in range(BFS_RELAX_ITERS):
+		rd.compute_list_bind_compute_pipeline(cl, pipeline_bfs)
+		rd.compute_list_bind_uniform_set(cl, uset_bfs, 0)
+		rd.compute_list_set_push_constant(cl, p, 32)
+		rd.compute_list_dispatch(cl, gx, gy, 1)
+		rd.compute_list_add_barrier(cl)
+
+	# GRADIENT
+	p.encode_s32(8, 2)
+	rd.compute_list_bind_compute_pipeline(cl, pipeline_bfs)
+	rd.compute_list_bind_uniform_set(cl, uset_bfs, 0)
+	rd.compute_list_set_push_constant(cl, p, 32)
+	rd.compute_list_dispatch(cl, gx, gy, 1)
+	rd.compute_list_add_barrier(cl)
+
+
 func upload_static_data() -> void:
 	_upload(buf_terrain, terrain)
+	upload_goal_data()
+
+
+func upload_goal_data() -> void:
 	_upload(buf_goal_dist, goal_dist)
 	var gx_bytes := gdir_x.to_byte_array()
 	rd.buffer_update(buf_gdir_x, 0, gx_bytes.size(), gx_bytes)
@@ -324,14 +396,13 @@ func _zero_bytes(count: int) -> PackedByteArray:
 func cleanup() -> void:
 	if rd == null:
 		return
-	rd.free_rid(uset_flux)
-	rd.free_rid(uset_vel)
-	rd.free_rid(pipeline_flux)
-	rd.free_rid(pipeline_vel)
-	rd.free_rid(shader_flux)
-	rd.free_rid(shader_vel)
-	for buf in [buf_density, buf_goal_dist, buf_goal_dist_all, buf_terrain,
+	for rid in [uset_flux, uset_vel, uset_bfs,
+				pipeline_flux, pipeline_vel, pipeline_bfs,
+				shader_flux, shader_vel, shader_bfs,
+				buf_density, buf_goal_dist, buf_goal_dist_all, buf_terrain,
 				buf_fr, buf_fl, buf_fd, buf_fu,
-				buf_gdir_x, buf_gdir_y, buf_out_vx, buf_out_vy]:
-		rd.free_rid(buf)
+				buf_gdir_x, buf_gdir_y, buf_out_vx, buf_out_vy,
+				buf_bfs_dist]:
+		if rid.is_valid():
+			rd.free_rid(rid)
 	rd = null
