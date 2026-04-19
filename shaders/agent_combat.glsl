@@ -96,14 +96,13 @@ void main() {
 				}
 			}
 			if (!enemies_adjacent) {
-				cooldown[i] = max(cooldown[i] - dt, 0.0);
 				if (damage_acc[i] >= max_hp[i]) {
 					agent_info[i] = agent_info[i] & ~1u;
 					return;
 				}
-				// 同格争夺排斥尚未发生：保持攻击态，继续下游索敌，不在此提前 return
-				if (cooldown[i] <= 0.0 && !attacking_peer_same_cell(i, px, py, ifc)) {
-					agent_info[i] = info & ~(1u << 9u);
+				float cd = cooldown[i];
+				if (cd > dt) {
+					cooldown[i] = cd - dt;
 					return;
 				}
 			}
@@ -152,8 +151,8 @@ void main() {
 			cooldown[i] = attack_cd_base;
 			agent_info[i] = info | (1u << 9u);
 		} else {
-			cooldown[i] = max(my_cd - dt, 0.0);
-			if (my_cd <= 0.0 && !attacking_peer_same_cell(i, px, py, ifc))
+			cooldown[i] = max(my_cd - dt, -0.15);
+			if (my_cd < -0.1 && !attacking_peer_same_cell(i, px, py, ifc))
 				agent_info[i] = info & ~(1u << 9u);
 		}
 	}

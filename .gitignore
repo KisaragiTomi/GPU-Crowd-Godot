@@ -23,3 +23,9 @@ Thumbs.db
 
 # Local logs
 debug.log
+
+# Temp screenshots
+screenshot*.png
+screenshot*.wav
+battle_shot*.png
+battle_shot*.wav
