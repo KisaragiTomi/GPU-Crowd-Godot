@@ -8,6 +8,9 @@
 export.cfg
 export_presets.cfg
 
+# Build output
+build/
+
 # Mono (if used)
 .mono/
 data_*/
@@ -24,8 +27,9 @@ Thumbs.db
 # Local logs
 debug.log
 
-# Temp screenshots
-screenshot*.png
-screenshot*.wav
-battle_shot*.png
-battle_shot*.wav
+# Screenshots (dev artifacts)
+screenshots/
+
+# Cursor local MCP config
+.cursor/mcp.json
+.cursor/rules/mcp-messenger.mdc

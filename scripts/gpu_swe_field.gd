@@ -57,6 +57,10 @@ var uset_vel: RID
 var groups_x: int
 var groups_y: int
 
+# Sparse tile dispatch (decoupled module)
+var sparse: SparseTileDispatch
+var sparse_enabled := false
+
 
 func _init(rendering_device: RenderingDevice, width: int, height: int,
 		   cell_size: float, p_max_groups: int = 1) -> void:
@@ -103,8 +107,22 @@ func build_goal_field(goals: Array[Vector2i]) -> void:
 
 func build_all_goal_fields(group_goals: Array) -> void:
 	goal_dist_all.fill(1e6)
-	for g in range(mini(group_goals.size(), max_groups)):
-		build_goal_field_group(g, group_goals[g])
+	if group_goals.is_empty():
+		return
+	build_goal_field_group(0, group_goals[0])
+	var base_dist := goal_dist_all.slice(0, cell_count)
+	var base_gx := gdir_x.slice(0, cell_count)
+	var base_gy := gdir_y.slice(0, cell_count)
+	var all_dist := PackedFloat32Array()
+	var all_gx := PackedFloat32Array()
+	var all_gy := PackedFloat32Array()
+	for _g in range(max_groups):
+		all_dist.append_array(base_dist)
+		all_gx.append_array(base_gx)
+		all_gy.append_array(base_gy)
+	goal_dist_all = all_dist
+	gdir_x = all_gx
+	gdir_y = all_gy
 
 
 func build_goal_field_group(group: int, goals) -> void:
@@ -240,6 +258,10 @@ func _init_gpu() -> void:
 	zb_uint.fill(0xFF)
 	buf_bfs_dist = rd.storage_buffer_create(cell_count * 4, zb_uint)
 
+	# Sparse tile dispatch (decoupled module)
+	sparse = SparseTileDispatch.new(rd, gw, gh, 8, 1, 0.001)
+	sparse.set_activity_buffers(buf_density, buf_terrain)
+
 	_build_uniform_sets()
 
 
@@ -247,12 +269,14 @@ func _build_uniform_sets() -> void:
 	uset_flux = rd.uniform_set_create([
 		_ubuf(0, buf_density), _ubuf(1, buf_goal_dist), _ubuf(2, buf_terrain),
 		_ubuf(3, buf_fr), _ubuf(4, buf_fl), _ubuf(5, buf_fd), _ubuf(6, buf_fu),
+		_ubuf(7, sparse.buf_compact_tile_coords),
 	], shader_flux, 0)
 	uset_vel = rd.uniform_set_create([
 		_ubuf(0, buf_fr), _ubuf(1, buf_fl), _ubuf(2, buf_fd), _ubuf(3, buf_fu),
 		_ubuf(4, buf_terrain), _ubuf(5, buf_density),
 		_ubuf(6, buf_gdir_x), _ubuf(7, buf_gdir_y),
 		_ubuf(8, buf_out_vx), _ubuf(9, buf_out_vy),
+		_ubuf(10, sparse.buf_compact_tile_coords),
 	], shader_vel, 0)
 
 
@@ -338,6 +362,14 @@ func _upload(buf: RID, arr: PackedFloat32Array) -> void:
 
 # ── Dispatch (caller owns the compute list) ──────────────────────────────
 
+func reset_compact_counter() -> void:
+	sparse.reset_counter()
+
+
+func dispatch_compact_tiles(cl: int) -> void:
+	sparse.dispatch_compact(cl)
+
+
 func dispatch_swe(cl: int, swe_dt: float) -> void:
 	var push := PackedByteArray(); push.resize(48)
 	push.encode_s32(0, gw)
@@ -350,25 +382,45 @@ func dispatch_swe(cl: int, swe_dt: float) -> void:
 	push.encode_float(28, goal_scale)
 	push.encode_float(32, wall_scale)
 	push.encode_float(36, max_flux)
+	push.encode_s32(40, 1 if sparse_enabled else 0)
+	push.encode_float(44, 0.0)
 	rd.compute_list_bind_compute_pipeline(cl, pipeline_flux)
 	rd.compute_list_bind_uniform_set(cl, uset_flux, 0)
 	rd.compute_list_set_push_constant(cl, push, push.size())
-	rd.compute_list_dispatch(cl, groups_x, groups_y, 1)
+	if sparse_enabled:
+		rd.compute_list_dispatch_indirect(cl, sparse.buf_indirect_args, 0)
+	else:
+		rd.compute_list_dispatch(cl, groups_x, groups_y, 1)
 
 
 func dispatch_velocity(cl: int, num_groups: int = 1) -> void:
-	var push := PackedByteArray(); push.resize(16)
+	var push := PackedByteArray(); push.resize(32)
 	push.encode_s32(0, gw)
 	push.encode_s32(4, gh)
 	push.encode_float(8, agent_speed)
 	push.encode_float(12, density_slowdown)
+	push.encode_s32(16, 1 if sparse_enabled else 0)
+	push.encode_s32(20, 0)
+	push.encode_s32(24, 0)
+	push.encode_s32(28, 0)
 	rd.compute_list_bind_compute_pipeline(cl, pipeline_vel)
 	rd.compute_list_bind_uniform_set(cl, uset_vel, 0)
 	rd.compute_list_set_push_constant(cl, push, push.size())
-	rd.compute_list_dispatch(cl, groups_x, groups_y, num_groups)
+	if sparse_enabled:
+		rd.compute_list_dispatch_indirect(cl, sparse.buf_indirect_args, 0)
+	else:
+		rd.compute_list_dispatch(cl, groups_x, groups_y, num_groups)
 
 
 # ── Readback ─────────────────────────────────────────────────────────────
+
+func readback_compact_count() -> int:
+	return sparse.readback_tile_count()
+
+
+func readback_compact_tiles(count: int) -> PackedInt32Array:
+	return sparse.readback_tile_coords(count)
+
 
 func readback_density() -> void:
 	density = rd.buffer_get_data(buf_density).to_float32_array()
@@ -396,6 +448,9 @@ func _zero_bytes(count: int) -> PackedByteArray:
 func cleanup() -> void:
 	if rd == null:
 		return
+	if sparse:
+		sparse.cleanup()
+		sparse = null
 	for rid in [uset_flux, uset_vel, uset_bfs,
 				pipeline_flux, pipeline_vel, pipeline_bfs,
 				shader_flux, shader_vel, shader_bfs,

@@ -13,28 +13,44 @@ layout(set = 0, binding = 6, std430) restrict readonly  buffer B6 { float gdir_x
 layout(set = 0, binding = 7, std430) restrict readonly  buffer B7 { float gdir_y[];  };
 layout(set = 0, binding = 8, std430) restrict writeonly buffer B8 { float out_vx[];  };
 layout(set = 0, binding = 9, std430) restrict writeonly buffer B9 { float out_vy[];  };
+layout(set = 0, binding = 10, std430) restrict readonly buffer B10 { uint compact_tile_coords[]; };
 
 layout(push_constant, std430) uniform Params {
 	int   gw;
 	int   gh;
 	float agent_speed;
 	float density_slowdown;
+	int   sparse_mode;
+	int   _pad0;
+	int   _pad1;
+	int   _pad2;
 };
 
 shared uint s_busy;
 
 void main() {
-	int x = int(gl_GlobalInvocationID.x);
-	int y = int(gl_GlobalInvocationID.y);
+	int lx = int(gl_LocalInvocationID.x);
+	int ly = int(gl_LocalInvocationID.y);
 	int li = int(gl_LocalInvocationIndex);
 
+	int tile_x, tile_y;
+	if (sparse_mode != 0) {
+		uint packed = compact_tile_coords[gl_WorkGroupID.x];
+		tile_x = int(packed & 0xFFFFu);
+		tile_y = int(packed >> 16u);
+	} else {
+		tile_x = int(gl_WorkGroupID.x);
+		tile_y = int(gl_WorkGroupID.y);
+	}
+
+	int x = tile_x * 8 + lx;
+	int y = tile_y * 8 + ly;
 	int group = int(gl_GlobalInvocationID.z);
 	int gbase = group * gw * gh;
 
 	if (li == 0) s_busy = 0u;
 	barrier();
 
-	// Block-level probe: any cell with density or residual flux?
 	if (x < gw && y < gh) {
 		int i = y * gw + x;
 		if (terrain[i] < 0.5) {
@@ -46,7 +62,6 @@ void main() {
 	barrier();
 
 	if (s_busy == 0u) {
-		// Fast path: no agents, no flux — write static goal-gradient velocity
 		if (x < gw && y < gh) {
 			int i = y * gw + x;
 			if (terrain[i] > 0.5) {
