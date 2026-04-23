@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bcmprernki874"
+path="res://.godot/imported/std_compact_generic.glsl-bdfe701f98db330e925c4bd7c2169b7c.res"
+
+[deps]
+
+source_file="res://shaders/std_compact_generic.glsl"
+dest_files=["res://.godot/imported/std_compact_generic.glsl-bdfe701f98db330e925c4bd7c2169b7c.res"]
+
+[params]
+

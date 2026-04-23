@@ -11,6 +11,7 @@ layout(set = 0, binding = 4, std430) restrict readonly  buffer B4 { uint sorted_
 layout(set = 0, binding = 5, std430) restrict writeonly buffer B5 { float density_out[]; };
 layout(set = 0, binding = 6, std430) restrict readonly  buffer B6 { uint agent_info[]; };
 layout(set = 0, binding = 7, std430) restrict writeonly buffer B7 { uint faction_presence_out[]; };
+layout(set = 0, binding = 8, std430) restrict writeonly buffer B8 { uint cell_attacker_out[]; };
 
 layout(push_constant, std430) uniform Params {
 	int   field_gw;
@@ -51,6 +52,9 @@ void main() {
 				uint afac = (ainfo >> 1u) & 0x1Fu;
 				presence |= (1u << afac);
 
+				float weight = 1.0;
+				if ((ainfo & (1u << 9u)) != 0u) weight = 0.0;
+
 				float gx = pos_x[aid] * ifc;
 				float gy = pos_y[aid] * ifc;
 				int ix = int(floor(gx));
@@ -58,10 +62,10 @@ void main() {
 				float frac_x = gx - float(ix);
 				float frac_y = gy - float(iy);
 
-				if      (ix == fx     && iy == fy)     d += (1.0 - frac_x) * (1.0 - frac_y);
-				else if (ix + 1 == fx && iy == fy)     d += frac_x * (1.0 - frac_y);
-				else if (ix == fx     && iy + 1 == fy) d += (1.0 - frac_x) * frac_y;
-				else if (ix + 1 == fx && iy + 1 == fy) d += frac_x * frac_y;
+				if      (ix == fx     && iy == fy)     d += weight * (1.0 - frac_x) * (1.0 - frac_y);
+				else if (ix + 1 == fx && iy == fy)     d += weight * frac_x * (1.0 - frac_y);
+				else if (ix == fx     && iy + 1 == fy) d += weight * (1.0 - frac_x) * frac_y;
+				else if (ix + 1 == fx && iy + 1 == fy) d += weight * frac_x * frac_y;
 			}
 		}
 	}

@@ -35,12 +35,32 @@ layout(push_constant, std430) uniform Params {
 	uint  _pad0;         // 44
 };
 
+// 与另一名存活且「正在攻击」的单位同占一个场地格时，本帧不要清除攻击位：
+// combat 先于 steer 执行，否则会在 steer 打上排斥位(bit10)之前就把 bit9 清掉。
+bool attacking_peer_same_cell(uint self_idx, float px, float py, float ifc) {
+	int my_cx = clamp(int(px * ifc), 0, field_gw - 1);
+	int my_cy = clamp(int(py * ifc), 0, field_gh - 1);
+	int my_ci = my_cy * field_gw + my_cx;
+	int s = int(cell_start_buf[my_ci]);
+	int cnt = int(cell_count_buf[my_ci]);
+	for (int k = 0; k < cnt; k++) {
+		uint j = sorted_idx[s + k];
+		if (j == self_idx) continue;
+		uint ji = agent_info[j];
+		if ((ji & 1u) == 0u) continue;
+		if ((ji & (1u << 9u)) != 0u) return true;
+	}
+	return false;
+}
+
 void main() {
 	uint i = gl_GlobalInvocationID.x;
 	if (int(i) >= agent_count) return;
 
 	uint info = agent_info[i];
 	if ((info & 1u) == 0u) return;
+
+	bool is_displaced = (info & (1u << 10u)) != 0u;
 
 	uint faction   = (info >> 1u) & 0x1Fu;
 	uint ally_bits = alliance[faction];
@@ -53,82 +73,88 @@ void main() {
 		atomicMax(damage_acc[i], 0);
 	}
 
-	// --- distance field gate (with real-time fallback) ---
-	float px = pos_x[i];
-	float py = pos_y[i];
-	float ifc = inv_field_cs;
-	int gi_x = clamp(int(px * ifc), 0, field_gw - 1);
-	int gi_y = clamp(int(py * ifc), 0, field_gh - 1);
-	int gi   = gi_y * field_gw + gi_x;
+	if (!is_displaced) {
+		// --- distance field gate (with real-time fallback) ---
+		float px = pos_x[i];
+		float py = pos_y[i];
+		float ifc = inv_field_cs;
+		int gi_x = clamp(int(px * ifc), 0, field_gw - 1);
+		int gi_y = clamp(int(py * ifc), 0, field_gh - 1);
+		int gi   = gi_y * field_gw + gi_x;
 
-	uint group = fac_to_group[faction];
-	float gdist = goal_dist_all[int(group) * field_cells + gi];
-	float range_cells = atk_range[i] * ifc + 2.0;
-	if (gdist > range_cells) {
-		// Distance field says far — check faction_presence as real-time fallback
-		bool enemies_adjacent = false;
-		for (int fy = max(gi_y - 1, 0); fy <= min(gi_y + 1, field_gh - 1) && !enemies_adjacent; fy++) {
-			for (int fx = max(gi_x - 1, 0); fx <= min(gi_x + 1, field_gw - 1); fx++) {
-				if ((faction_presence[fy * field_gw + fx] & enemy_msk) != 0u) {
-					enemies_adjacent = true;
-					break;
+		uint group = fac_to_group[faction];
+		float gdist = goal_dist_all[int(group) * field_cells + gi];
+		float range_cells = atk_range[i] * ifc + 2.0;
+		if (gdist > range_cells) {
+			bool enemies_adjacent = false;
+			for (int fy = max(gi_y - 1, 0); fy <= min(gi_y + 1, field_gh - 1) && !enemies_adjacent; fy++) {
+				for (int fx = max(gi_x - 1, 0); fx <= min(gi_x + 1, field_gw - 1); fx++) {
+					if ((faction_presence[fy * field_gw + fx] & enemy_msk) != 0u) {
+						enemies_adjacent = true;
+						break;
+					}
+				}
+			}
+			if (!enemies_adjacent) {
+				if (damage_acc[i] >= max_hp[i]) {
+					agent_info[i] = agent_info[i] & ~1u;
+					return;
+				}
+				float cd = cooldown[i];
+				if (cd > dt) {
+					cooldown[i] = cd - dt;
+					return;
 				}
 			}
 		}
-		if (!enemies_adjacent) {
-			cooldown[i] = max(cooldown[i] - dt, 0.0);
-			if (cooldown[i] <= 0.0)
+
+		// --- neighbor scan (radius scales with attack range) ---
+		float my_range = atk_range[i];
+		float my_range_sq = my_range * my_range;
+		int scan_r = clamp(int(ceil(my_range * sg_inv_cs)), 1, 4);
+
+		uint  best_enemy = 0xFFFFFFFFu;
+		float best_dsq   = 1e10;
+
+		int hcx = clamp(int(px * sg_inv_cs), 0, sg_w - 1);
+		int hcy = clamp(int(py * sg_inv_cs), 0, sg_h - 1);
+		for (int ny = max(hcy - scan_r, 0); ny <= min(hcy + scan_r, sg_h - 1); ny++) {
+			int row = ny * sg_w;
+			for (int nx = max(hcx - scan_r, 0); nx <= min(hcx + scan_r, sg_w - 1); nx++) {
+				int ci  = row + nx;
+				int s   = int(cell_start_buf[ci]);
+				int cnt = int(cell_count_buf[ci]);
+				for (int k = 0; k < cnt; k++) {
+					uint j = sorted_idx[s + k];
+					if (j == i) continue;
+					uint ji = agent_info[j];
+					if ((ji & 1u) == 0u) continue;
+					uint jf = (ji >> 1u) & 0x1Fu;
+					if (((1u << jf) & enemy_msk) == 0u) continue;
+					float djx = px - pos_x[j];
+					float djy = py - pos_y[j];
+					float dsq = djx * djx + djy * djy;
+					if (dsq < best_dsq && dsq < my_range_sq) {
+						best_enemy = j;
+						best_dsq = dsq;
+					}
+				}
+			}
+		}
+
+		// --- attack ---
+		float my_cd = cooldown[i];
+
+		if (best_enemy != 0xFFFFFFFFu && my_cd <= 0.0) {
+			int dmg = int(atk_damage[i] * 100.0);
+			atomicAdd(damage_acc[best_enemy], dmg);
+			cooldown[i] = attack_cd_base;
+			agent_info[i] = info | (1u << 9u);
+		} else {
+			cooldown[i] = max(my_cd - dt, -0.15);
+			if (my_cd < -0.1 && !attacking_peer_same_cell(i, px, py, ifc))
 				agent_info[i] = info & ~(1u << 9u);
-			return;
 		}
-	}
-
-	// --- neighbor scan (radius scales with attack range) ---
-	float my_range = atk_range[i];
-	float my_range_sq = my_range * my_range;
-	int scan_r = clamp(int(ceil(my_range * sg_inv_cs)), 1, 4);
-
-	uint  best_enemy = 0xFFFFFFFFu;
-	float best_dsq   = 1e10;
-
-	int hcx = clamp(int(px * sg_inv_cs), 0, sg_w - 1);
-	int hcy = clamp(int(py * sg_inv_cs), 0, sg_h - 1);
-	for (int ny = max(hcy - scan_r, 0); ny <= min(hcy + scan_r, sg_h - 1); ny++) {
-		int row = ny * sg_w;
-		for (int nx = max(hcx - scan_r, 0); nx <= min(hcx + scan_r, sg_w - 1); nx++) {
-			int ci  = row + nx;
-			int s   = int(cell_start_buf[ci]);
-			int cnt = int(cell_count_buf[ci]);
-			for (int k = 0; k < cnt; k++) {
-				uint j = sorted_idx[s + k];
-				if (j == i) continue;
-				uint ji = agent_info[j];
-				if ((ji & 1u) == 0u) continue;
-				uint jf = (ji >> 1u) & 0x1Fu;
-				if (((1u << jf) & enemy_msk) == 0u) continue;
-				float djx = px - pos_x[j];
-				float djy = py - pos_y[j];
-				float dsq = djx * djx + djy * djy;
-				if (dsq < best_dsq && dsq < my_range_sq) {
-					best_enemy = j;
-					best_dsq = dsq;
-				}
-			}
-		}
-	}
-
-	// --- attack ---
-	float my_cd = cooldown[i];
-
-	if (best_enemy != 0xFFFFFFFFu && my_cd <= 0.0) {
-		int dmg = int(atk_damage[i] * 100.0);
-		atomicAdd(damage_acc[best_enemy], dmg);
-		cooldown[i] = attack_cd_base;
-		agent_info[i] = info | (1u << 9u);
-	} else {
-		cooldown[i] = max(my_cd - dt, 0.0);
-		if (my_cd <= 0.0)
-			agent_info[i] = info & ~(1u << 9u);
 	}
 
 	// --- death ---
