@@ -19,6 +19,9 @@ layout(set = 0, binding = 12, std430) restrict readonly  buffer B12 { uint  fact
 layout(set = 0, binding = 13, std430) restrict readonly  buffer B13 { float goal_dist_all[];    };
 layout(set = 0, binding = 14, std430) restrict readonly  buffer B14 { uint  alliance[];         };
 layout(set = 0, binding = 15, std430) restrict readonly  buffer B15 { uint  fac_to_group[];     };
+layout(set = 0, binding = 16, std430) restrict           buffer B16 { vec4  laser_line[];        };
+layout(set = 0, binding = 17, std430) restrict           buffer B17 { float laser_ttl[];         };
+layout(set = 0, binding = 18, std430) restrict           buffer B18 { int   hit_flash[];         };
 
 layout(push_constant, std430) uniform Params {
 	int   agent_count;   // 0
@@ -33,7 +36,13 @@ layout(push_constant, std430) uniform Params {
 	int   field_gh;      // 36
 	int   field_cells;   // 40  (gw*gh, for goal_dist offset)
 	uint  _pad0;         // 44
+	float laser_life;    // 48
+	float hit_flash_decay_per_sec; // 52
+	int   hit_flash_value;         // 56
+	float _pad3;         // 60
 };
+
+const int HIT_FLASH_SCALE = 1024;
 
 // 与另一名存活且「正在攻击」的单位同占一个场地格时，本帧不要清除攻击位：
 // combat 先于 steer 执行，否则会在 steer 打上排斥位(bit10)之前就把 bit9 清掉。
@@ -58,7 +67,18 @@ void main() {
 	if (int(i) >= agent_count) return;
 
 	uint info = agent_info[i];
-	if ((info & 1u) == 0u) return;
+	laser_ttl[i] = max(laser_ttl[i] - dt, 0.0);
+	if ((info & 1u) == 0u) {
+		laser_ttl[i] = 0.0;
+		atomicExchange(hit_flash[i], 0);
+		return;
+	}
+
+	int hit_decay = int(hit_flash_decay_per_sec * dt * float(HIT_FLASH_SCALE) + 0.5);
+	if (hit_decay > 0) {
+		atomicAdd(hit_flash[i], -hit_decay);
+		atomicMax(hit_flash[i], 0);
+	}
 
 	bool is_displaced = (info & (1u << 10u)) != 0u;
 
@@ -148,8 +168,13 @@ void main() {
 		if (best_enemy != 0xFFFFFFFFu && my_cd <= 0.0) {
 			int dmg = int(atk_damage[i] * 100.0);
 			atomicAdd(damage_acc[best_enemy], dmg);
+			atomicMax(hit_flash[best_enemy], hit_flash_value);
 			cooldown[i] = attack_cd_base;
 			agent_info[i] = info | (1u << 9u);
+			if ((info & (1u << 7u)) != 0u && laser_life > 0.0) {
+				laser_line[i] = vec4(px, py, pos_x[best_enemy], pos_y[best_enemy]);
+				laser_ttl[i] = laser_life;
+			}
 		} else {
 			cooldown[i] = max(my_cd - dt, -0.15);
 			if (my_cd < -0.1 && !attacking_peer_same_cell(i, px, py, ifc))

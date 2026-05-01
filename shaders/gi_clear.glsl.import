@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dnj1tmx1qdcw"
+path="res://.godot/imported/gi_clear.glsl-13b54c7338b918a287af238ddb86dd9d.res"
+
+[deps]
+
+source_file="res://shaders/gi_clear.glsl"
+dest_files=["res://.godot/imported/gi_clear.glsl-13b54c7338b918a287af238ddb86dd9d.res"]
+
+[params]
+

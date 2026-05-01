@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cp8fldl7bgyol"
+path="res://.godot/imported/gi_wall_mask.glsl-069e8d864e57119cb089e5df9dfc6ecc.res"
+
+[deps]
+
+source_file="res://shaders/gi_wall_mask.glsl"
+dest_files=["res://.godot/imported/gi_wall_mask.glsl-069e8d864e57119cb089e5df9dfc6ecc.res"]
+
+[params]
+

@@ -1,8 +1,69 @@
 extends Node2D
 
+class MinimapOverlay:
+	extends Control
+
+	var sim
+
+	func _draw() -> void:
+		if sim == null or sim.cam == null:
+			return
+		var map_rect := Rect2(Vector2.ZERO, size)
+		draw_rect(map_rect, Color(0.02, 0.025, 0.03, 0.2), true)
+		draw_rect(map_rect, Color(0.85, 0.9, 1.0, 0.9), false, 2.0)
+
+		if sim.world_size.x <= 0.0 or sim.world_size.y <= 0.0:
+			return
+		var vp_size: Vector2 = sim.get_viewport().get_visible_rect().size
+		var zoom: Vector2 = sim.cam.zoom
+		var view_size := Vector2(vp_size.x / zoom.x, vp_size.y / zoom.y)
+		var view_pos: Vector2 = sim.cam.global_position - view_size * 0.5
+		var map_scale: Vector2 = size / sim.world_size
+		var view_rect := Rect2(
+			Vector2(view_pos.x * map_scale.x, view_pos.y * map_scale.y),
+			Vector2(view_size.x * map_scale.x, view_size.y * map_scale.y)
+		)
+		view_rect = view_rect.intersection(map_rect.grow(-2.0))
+		if view_rect.size.x <= 0.0 or view_rect.size.y <= 0.0:
+			return
+		draw_rect(view_rect, Color(1.0, 0.92, 0.25, 0.16), true)
+		draw_rect(view_rect, Color(1.0, 0.92, 0.25, 0.95), false, 1.5)
+
+
+class LaserOverlay:
+	extends Node2D
+
+	var sim
+
+	func _draw() -> void:
+		if sim != null:
+			sim._draw_lasers(self)
+
+
 const MAX_AGENTS := 100000
 const NUM_FACTIONS := 32
 const NUM_GOAL_GROUPS := 32
+const CAM_PAN_SPEED := 800.0
+const MINIMAP_SCREEN_FRACTION := 0.2
+const MINIMAP_MARGIN := 12.0
+const GI_REGION_SCALE := 1.2
+const GI_PRECISION_MIN := 0.50
+const GI_PRECISION_MAX := 1.00
+const GI_PRECISION_STEP := 0.05
+const GI_AGENT_EMIT_STRENGTH := 1.15
+const GI_AGENT_SPLAT_RADIUS_SCALE := 1.0
+const GI_DISPLAY_ALPHA := 0.60
+const HIT_GI_FLASH_DECAY_PER_SEC := 12.0
+const HIT_GI_FLASH_VALUE := 0.75
+const RANGED_LASER_LIFE := 0.12
+const RANGED_LASER_GI_WIDTH_WORLD := 0.45
+const RANGED_LASER_GI_STRENGTH := 3.6
+const RANGED_LASER_VIS_WIDTH := 0.28
+const RANGED_LASER_VIS_GLOW_WIDTH := 0.78
+const RANGED_LASER_VIS_SOFT_WIDTH := 1.55
+const RENDER_LAYER_WORLD := 1 << 0
+const RENDER_LAYER_MINIMAP := 1 << 1
+const RENDER_LAYER_WORLD_AND_MINIMAP := RENDER_LAYER_WORLD | RENDER_LAYER_MINIMAP
 
 @export var grid_width := 800
 @export var grid_height := 480
@@ -108,22 +169,50 @@ var cached_cell_blocked := PackedInt32Array()
 var _agent_debounce_timer: Timer
 var _agent_pending_count := -1
 
+# GI (Radiance Cascades)
+var gi: GPUGI
+var _gi_sprite: Sprite2D
+var _gi_enabled := true
+var _gi_frame_skip := 2
+var _gi_frame_counter := 0
+var _gi_tex_w := 400
+var _gi_tex_h := 240
+var _gi_precision := 0.50
+var _gi_emit_strength := GI_AGENT_EMIT_STRENGTH
+var _laser_overlay: LaserOverlay
+var cached_laser_lines := PackedFloat32Array()
+var cached_laser_ttl := PackedFloat32Array()
+var _laser_any_active := false
+
 # HUD
 var fps_label: Label
 var hud_label: Label
 var slider_agents: HSlider
 var label_agents: Label
+var slider_music_volume: HSlider
+var label_music_volume: Label
+var slider_gi_precision: HSlider
+var label_gi_precision: Label
 var btn_density: CheckButton
 var btn_velocity: CheckButton
 var btn_pause: Button
+var bgm_player: AudioStreamPlayer
+var _music_volume := 0.5
 var cam: Camera2D
 var cam_zoom := 1.0
 var cam_dragging := false
 var cam_drag_origin := Vector2.ZERO
+var _gi_precision_debounce_timer: Timer
+var _minimap_root: Control
+var _minimap_texture: TextureRect
+var _minimap_viewport: SubViewport
+var _minimap_camera: Camera2D
+var _minimap_overlay: MinimapOverlay
 
 
 func _ready() -> void:
 	world_size = Vector2(grid_width * cell_size, grid_height * cell_size)
+	visibility_layer = RENDER_LAYER_WORLD_AND_MINIMAP
 
 	cam = $Camera2D
 
@@ -156,12 +245,129 @@ func _ready() -> void:
 
 	_setup_multimesh()
 	_setup_overlay()
+	_setup_laser_overlay()
+	_setup_gi()
 	_setup_hud()
 	_play_bgm()
 
 
 func _exit_tree() -> void:
+	if gi:
+		gi.cleanup()
 	_cleanup_overlay()
+
+
+func _setup_gi() -> void:
+	if gi:
+		gi.cleanup()
+
+	var tex_size := _get_gi_texture_size()
+	_gi_tex_w = tex_size.x
+	_gi_tex_h = tex_size.y
+	gi = GPUGI.new(rd, _gi_tex_w, _gi_tex_h)
+	gi.laser_emit_strength = RANGED_LASER_GI_STRENGTH
+	gi.laser_life = RANGED_LASER_LIFE
+	_update_gi_buffers()
+
+	if _gi_sprite == null:
+		_gi_sprite = Sprite2D.new()
+		_gi_sprite.centered = false
+		_gi_sprite.z_index = 2
+		_gi_sprite.visibility_layer = RENDER_LAYER_WORLD
+		_gi_sprite.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR
+		var mat := CanvasItemMaterial.new()
+		mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+		_gi_sprite.material = mat
+		_gi_sprite.modulate = Color(1.0, 1.0, 1.0, GI_DISPLAY_ALPHA)
+		add_child(_gi_sprite)
+	_gi_sprite.texture = null
+	_gi_sprite.visible = _gi_enabled
+	var gi_region := _get_gi_region_rect()
+	_apply_gi_world_scale(gi_region)
+	_update_gi_sprite_rect(gi_region)
+	_update_gi_precision_label()
+
+
+func _update_gi_buffers() -> void:
+	if gi == null or agents == null:
+		return
+	gi.set_agent_buffers(
+		agents.buf_pos_x[agents.cur],
+		agents.buf_pos_y[agents.cur],
+		agents.buf_agent_info,
+		agents.buf_mm_fac_colors,
+		agents.buf_hit_flash
+	)
+	gi.set_laser_buffers(agents.buf_laser_lines, agents.buf_laser_ttl)
+	if field:
+		gi.set_terrain_buffer(field.buf_terrain, grid_width, grid_height, cell_size)
+
+
+func _setup_laser_overlay() -> void:
+	if _laser_overlay != null:
+		return
+	_laser_overlay = LaserOverlay.new()
+	_laser_overlay.sim = self
+	_laser_overlay.z_index = 4
+	_laser_overlay.visibility_layer = RENDER_LAYER_WORLD
+	var mat := CanvasItemMaterial.new()
+	mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+	_laser_overlay.material = mat
+	_laser_overlay.visible = false
+	add_child(_laser_overlay)
+
+
+func _get_gi_texture_size() -> Vector2i:
+	var vp_size := get_viewport().get_visible_rect().size
+	return Vector2i(
+		maxi(32, roundi(vp_size.x * _gi_precision)),
+		maxi(32, roundi(vp_size.y * _gi_precision))
+	)
+
+
+func _get_gi_region_rect() -> Rect2:
+	var vp_size := get_viewport().get_visible_rect().size
+	var zoom := cam.zoom if cam else Vector2.ONE
+	var view_size := Vector2(vp_size.x / zoom.x, vp_size.y / zoom.y)
+	var region_size := view_size * GI_REGION_SCALE
+	var region_pos := (cam.global_position if cam else world_size * 0.5) - region_size * 0.5
+	return Rect2(region_pos, region_size)
+
+
+func _update_gi_sprite_rect(region: Rect2) -> void:
+	if _gi_sprite == null:
+		return
+	_gi_sprite.position = region.position
+	_gi_sprite.scale = Vector2(region.size.x / float(_gi_tex_w), region.size.y / float(_gi_tex_h))
+
+
+func _get_gi_world_per_texel(region: Rect2) -> float:
+	var wx := region.size.x / maxf(float(_gi_tex_w), 1.0)
+	var wy := region.size.y / maxf(float(_gi_tex_h), 1.0)
+	return maxf((wx + wy) * 0.5, 0.001)
+
+
+func _world_to_gi_texels(world_length: float, region: Rect2) -> float:
+	return maxf(world_length / _get_gi_world_per_texel(region), 0.05)
+
+
+func _get_gi_agent_splat_radius_world() -> float:
+	return maxf(agent_radius * GI_AGENT_SPLAT_RADIUS_SCALE, cell_size * 0.45)
+
+
+func _apply_gi_world_scale(region: Rect2) -> void:
+	if gi == null:
+		return
+	var world_per_texel := _get_gi_world_per_texel(region)
+	var reference_world_per_texel := GI_REGION_SCALE / GI_PRECISION_MIN
+	gi.interval_scale = clampf(reference_world_per_texel / world_per_texel, 0.125, 8.0)
+	gi.laser_width = _world_to_gi_texels(RANGED_LASER_GI_WIDTH_WORLD, region)
+
+
+func _ensure_gi_texture_size() -> void:
+	var wanted := _get_gi_texture_size()
+	if wanted.x != _gi_tex_w or wanted.y != _gi_tex_h:
+		_setup_gi()
 
 
 # ── Faction / Alliance setup ─────────────────────────────────────────────
@@ -201,6 +407,7 @@ func _build_environment() -> void:
 	_wall_sprite = Sprite2D.new()
 	_wall_sprite.centered = false
 	_wall_sprite.z_index = 0
+	_wall_sprite.visibility_layer = RENDER_LAYER_WORLD_AND_MINIMAP
 	_wall_sprite.scale = Vector2(cell_size, cell_size)
 	_wall_sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	add_child(_wall_sprite)
@@ -447,6 +654,7 @@ func _setup_multimesh() -> void:
 	mm_instance = MultiMeshInstance2D.new()
 	mm_instance.multimesh = multi_mesh
 	mm_instance.texture = _make_circle_texture(12)
+	mm_instance.visibility_layer = RENDER_LAYER_WORLD_AND_MINIMAP
 	add_child(mm_instance)
 
 
@@ -482,6 +690,7 @@ func _setup_overlay() -> void:
 	_ov_sprite = Sprite2D.new()
 	_ov_sprite.centered = false
 	_ov_sprite.z_index = 1
+	_ov_sprite.visibility_layer = RENDER_LAYER_WORLD
 	_ov_sprite.scale = Vector2(cell_size, cell_size)
 	_ov_sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	_ov_sprite.visible = false
@@ -617,6 +826,23 @@ func _sync_multimesh_cpu() -> void:
 	perf_mm_set_buffer    = lerpf(perf_mm_set_buffer,    float(te - td) / 1000.0, a)
 
 
+func _sync_laser_overlay() -> void:
+	if _laser_overlay == null:
+		return
+	cached_laser_ttl = agents.readback_laser_ttl(agent_count)
+	_laser_any_active = false
+	for ttl in cached_laser_ttl:
+		if ttl > 0.0:
+			_laser_any_active = true
+			break
+	if _laser_any_active:
+		cached_laser_lines = agents.readback_laser_lines(agent_count)
+		_laser_overlay.visible = true
+		_laser_overlay.queue_redraw()
+	else:
+		_laser_overlay.visible = false
+
+
 func _pick_agent(world_pos: Vector2) -> void:
 	agent_pos = agents.readback_current_positions()
 	cached_info = agents.readback_agent_info()
@@ -717,6 +943,18 @@ func _process(dt: float) -> void:
 	_last_frame_usec = now_usec
 
 	_flush_paint()
+	_queue_minimap_redraw()
+
+	# WASD camera pan
+	if cam:
+		var move := Vector2.ZERO
+		if Input.is_key_pressed(KEY_W): move.y -= 1.0
+		if Input.is_key_pressed(KEY_S): move.y += 1.0
+		if Input.is_key_pressed(KEY_A): move.x -= 1.0
+		if Input.is_key_pressed(KEY_D): move.x += 1.0
+		if move != Vector2.ZERO:
+			cam.position += move.normalized() * CAM_PAN_SPEED * dt / cam_zoom
+
 	if paused:
 		return
 
@@ -745,7 +983,8 @@ func _process(dt: float) -> void:
 	rd.compute_list_add_barrier(cl)
 
 	# 5 — Combat
-	agents.dispatch_combat(cl, dt, engage_range, attack_cd_base)
+	agents.dispatch_combat(cl, dt, engage_range, attack_cd_base, RANGED_LASER_LIFE,
+						   HIT_GI_FLASH_DECAY_PER_SEC, HIT_GI_FLASH_VALUE)
 	rd.compute_list_add_barrier(cl)
 
 	# 5.5 — Cell blocked map (per-group blockage bitmask)
@@ -776,8 +1015,34 @@ func _process(dt: float) -> void:
 		agent_pos = agents.readback_current_positions()
 	var t1c := Time.get_ticks_usec()
 	_sync_multimesh_gpu()
+	_sync_laser_overlay()
 	var t2 := Time.get_ticks_usec()
 	_update_select_label()
+
+	# 8.5 — GI (Radiance Cascades) — every N frames
+	if _gi_enabled and _gi_sprite != null:
+		_gi_frame_counter += 1
+		if _gi_frame_counter >= _gi_frame_skip:
+			_gi_frame_counter = 0
+			_ensure_gi_texture_size()
+			_update_gi_buffers()
+			var gi_region := _get_gi_region_rect()
+			_apply_gi_world_scale(gi_region)
+			_update_gi_sprite_rect(gi_region)
+			var splat_radius := _world_to_gi_texels(_get_gi_agent_splat_radius_world(), gi_region)
+			gi.compute_gi(agent_count, gi_region.position, gi_region.size,
+						   splat_radius, _gi_emit_strength)
+			var gi_img := gi.get_output_image()
+			if _gi_sprite.texture == null:
+				_gi_sprite.texture = ImageTexture.create_from_image(gi_img)
+				gi_img.save_png("user://gi_debug_stage%d.png" % gi.debug_stage)
+				print("[GI] Saved debug image: user://gi_debug_stage%d.png" % gi.debug_stage)
+				# Also save viewport screenshot
+				await get_tree().process_frame
+				get_viewport().get_texture().get_image().save_png("user://gi_viewport.png")
+				print("[GI] Saved viewport: user://gi_viewport.png")
+			else:
+				(_gi_sprite.texture as ImageTexture).update(gi_img)
 
 	# 9 — Dynamic goal update (GPU BFS, 1 group per frame round-robin)
 	var goal_ms := 0.0
@@ -844,11 +1109,19 @@ func _play_bgm() -> void:
 		return
 	var player := AudioStreamPlayer.new()
 	player.stream = stream
-	player.volume_db = -6.0
+	player.volume_db = _music_volume_to_db(_music_volume)
 	player.bus = "Master"
 	add_child(player)
+	bgm_player = player
 	player.play()
 	player.finished.connect(player.play)
+
+
+func _music_volume_to_db(value: float) -> float:
+	var linear := clampf(value, 0.0, 1.0)
+	if linear <= 0.001:
+		return -80.0
+	return linear_to_db(linear)
 
 
 # ── HUD ──────────────────────────────────────────────────────────────────
@@ -859,6 +1132,12 @@ func _setup_hud() -> void:
 	_agent_debounce_timer.wait_time = 1.0
 	_agent_debounce_timer.timeout.connect(_apply_agent_count)
 	add_child(_agent_debounce_timer)
+
+	_gi_precision_debounce_timer = Timer.new()
+	_gi_precision_debounce_timer.one_shot = true
+	_gi_precision_debounce_timer.wait_time = 0.25
+	_gi_precision_debounce_timer.timeout.connect(_apply_gi_precision)
+	add_child(_gi_precision_debounce_timer)
 
 	var canvas := CanvasLayer.new()
 	canvas.layer = 100
@@ -917,6 +1196,16 @@ func _setup_hud() -> void:
 	_update_agent_label()
 
 	vbox.add_child(_sep())
+	label_music_volume = Label.new()
+	label_music_volume.add_theme_font_size_override("font_size", 12)
+	label_music_volume.add_theme_color_override("font_color", Color(0.9, 0.75, 0.4))
+	vbox.add_child(label_music_volume)
+	slider_music_volume = _slider(0, 100, _music_volume * 100.0, 1)
+	slider_music_volume.value_changed.connect(_on_music_volume_changed)
+	vbox.add_child(slider_music_volume)
+	_update_music_volume_label()
+
+	vbox.add_child(_sep())
 	vbox.add_child(_lbl("Castle Template"))
 	var castle_hbox := HBoxContainer.new()
 	castle_hbox.add_theme_constant_override("separation", 4)
@@ -972,6 +1261,16 @@ func _setup_hud() -> void:
 	vbox.add_child(btn_velocity)
 
 	vbox.add_child(_sep())
+	label_gi_precision = Label.new()
+	label_gi_precision.add_theme_font_size_override("font_size", 12)
+	label_gi_precision.add_theme_color_override("font_color", Color(0.9, 0.75, 0.4))
+	vbox.add_child(label_gi_precision)
+	slider_gi_precision = _slider(GI_PRECISION_MIN, GI_PRECISION_MAX, _gi_precision, GI_PRECISION_STEP)
+	slider_gi_precision.value_changed.connect(_on_gi_precision_changed)
+	vbox.add_child(slider_gi_precision)
+	_update_gi_precision_label()
+
+	vbox.add_child(_sep())
 
 	var hbox := HBoxContainer.new()
 	hbox.add_theme_constant_override("separation", 8)
@@ -1000,6 +1299,75 @@ func _setup_hud() -> void:
 		queue_redraw()
 	)
 	vbox.add_child(slider_brush)
+
+	#_setup_minimap(canvas)
+
+
+func _setup_minimap(canvas: CanvasLayer) -> void:
+	_minimap_viewport = SubViewport.new()
+	_minimap_viewport.disable_3d = true
+	_minimap_viewport.transparent_bg = false
+	_minimap_viewport.canvas_cull_mask = RENDER_LAYER_MINIMAP
+	_minimap_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_minimap_viewport.world_2d = get_viewport().world_2d
+	canvas.add_child(_minimap_viewport)
+
+	_minimap_camera = Camera2D.new()
+	_minimap_camera.position = world_size * 0.5
+	_minimap_camera.enabled = true
+	_minimap_viewport.add_child(_minimap_camera)
+	_minimap_camera.make_current()
+
+	_minimap_root = Control.new()
+	_minimap_root.name = "Minimap"
+	_minimap_root.mouse_filter = Control.MOUSE_FILTER_STOP
+	_minimap_root.clip_contents = true
+	canvas.add_child(_minimap_root)
+
+	_minimap_texture = TextureRect.new()
+	_minimap_texture.texture = _minimap_viewport.get_texture()
+	_minimap_texture.stretch_mode = TextureRect.STRETCH_SCALE
+	_minimap_texture.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_minimap_root.add_child(_minimap_texture)
+
+	_minimap_overlay = MinimapOverlay.new()
+	_minimap_overlay.sim = self
+	_minimap_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_minimap_root.add_child(_minimap_overlay)
+
+	_update_minimap_layout()
+	get_viewport().size_changed.connect(_update_minimap_layout)
+
+
+func _update_minimap_layout() -> void:
+	if _minimap_root == null or _minimap_viewport == null:
+		return
+	var vp_size := get_viewport().get_visible_rect().size
+	var minimap_size := Vector2(
+		maxf(1.0, vp_size.x * MINIMAP_SCREEN_FRACTION),
+		maxf(1.0, vp_size.y * MINIMAP_SCREEN_FRACTION)
+	)
+	_minimap_root.position = Vector2(MINIMAP_MARGIN, vp_size.y - minimap_size.y - MINIMAP_MARGIN)
+	_minimap_root.size = minimap_size
+	_minimap_texture.position = Vector2.ZERO
+	_minimap_texture.size = minimap_size
+	_minimap_overlay.position = Vector2.ZERO
+	_minimap_overlay.size = minimap_size
+	_minimap_viewport.size = Vector2i(
+		maxi(1, roundi(minimap_size.x)),
+		maxi(1, roundi(minimap_size.y))
+	)
+
+	if _minimap_camera:
+		_minimap_camera.position = world_size * 0.5
+		var fit_zoom := minf(minimap_size.x / world_size.x, minimap_size.y / world_size.y)
+		_minimap_camera.zoom = Vector2(fit_zoom, fit_zoom)
+	_queue_minimap_redraw()
+
+
+func _queue_minimap_redraw() -> void:
+	if _minimap_overlay:
+		_minimap_overlay.queue_redraw()
 
 
 func _lbl(txt: String) -> Label:
@@ -1036,6 +1404,38 @@ func _update_agent_label() -> void:
 	label_agents.text = "Agents: %d" % agent_count
 	label_agents.add_theme_color_override("font_color", Color(0.9, 0.75, 0.4))
 
+
+func _update_music_volume_label() -> void:
+	if label_music_volume == null:
+		return
+	label_music_volume.text = "Music Volume: %d%%" % roundi(_music_volume * 100.0)
+
+
+func _on_music_volume_changed(val: float) -> void:
+	_music_volume = clampf(val / 100.0, 0.0, 1.0)
+	if bgm_player:
+		bgm_player.volume_db = _music_volume_to_db(_music_volume)
+	_update_music_volume_label()
+
+
+func _update_gi_precision_label() -> void:
+	if label_gi_precision == null:
+		return
+	var tex_size := _get_gi_texture_size()
+	label_gi_precision.text = "GI Precision: %.2fx  (%d x %d)" % [_gi_precision, tex_size.x, tex_size.y]
+
+
+func _on_gi_precision_changed(val: float) -> void:
+	_gi_precision = snappedf(val, GI_PRECISION_STEP)
+	_update_gi_precision_label()
+	_gi_precision_debounce_timer.start()
+
+
+func _apply_gi_precision() -> void:
+	_setup_gi()
+	_update_gi_precision_label()
+
+
 func _on_agents_changed(val: float) -> void:
 	_agent_pending_count = int(val)
 	label_agents.text = "Agents: %d (pending...)" % _agent_pending_count
@@ -1058,7 +1458,10 @@ func _apply_agent_count() -> void:
 	_upload_combat()
 	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
+	agents.clear_laser_events()
+	agents.clear_hit_flash_events()
 	_sync_multimesh_cpu()
+	_sync_laser_overlay()
 
 func _toggle_pause() -> void:
 	paused = not paused
@@ -1081,12 +1484,42 @@ func _reset_sim() -> void:
 	_upload_combat()
 	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
+	agents.clear_laser_events()
+	agents.clear_hit_flash_events()
 	_setup_goals()
 	field.upload_static_data()
 	_sync_multimesh_cpu()
+	_sync_laser_overlay()
 
 
 # ── Drawing ──────────────────────────────────────────────────────────────
+
+func _draw_lasers(layer: Node2D) -> void:
+	if cached_laser_ttl.is_empty() or cached_laser_lines.is_empty():
+		return
+	var max_i := mini(agent_count, cached_laser_ttl.size())
+	max_i = mini(max_i, int(cached_laser_lines.size() / 4))
+	var life := maxf(RANGED_LASER_LIFE, 0.001)
+	for i in range(max_i):
+		var ttl := cached_laser_ttl[i]
+		if ttl <= 0.0:
+			continue
+		var off := i * 4
+		var p0 := Vector2(cached_laser_lines[off], cached_laser_lines[off + 1])
+		var p1 := Vector2(cached_laser_lines[off + 2], cached_laser_lines[off + 3])
+		if p0.distance_squared_to(p1) < 1.0:
+			continue
+		var fade := clampf(ttl / life, 0.0, 1.0)
+		var fac := 0
+		if i < agent_factions.size():
+			fac = agent_factions[i]
+		elif i < cpu_agent_info.size():
+			fac = (cpu_agent_info[i] >> 1) & 0x1F
+		var fac_col := faction_colors[fac] if fac < faction_colors.size() else Color.WHITE
+		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.055 * fade), RANGED_LASER_VIS_SOFT_WIDTH, true)
+		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.16 * fade), RANGED_LASER_VIS_GLOW_WIDTH, true)
+		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.62 * fade), RANGED_LASER_VIS_WIDTH, true)
+
 
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, world_size), Color(0.11, 0.11, 0.14))
@@ -1169,14 +1602,19 @@ func _unhandled_input(event: InputEvent) -> void:
 		match event.keycode:
 			KEY_SPACE: _toggle_pause()
 			KEY_R: _reset_sim()
-			KEY_D:
-				show_density = not show_density
-				btn_density.button_pressed = show_density
-				if not show_density and not show_velocity: _hide_overlay()
 			KEY_V:
 				show_velocity = not show_velocity
 				btn_velocity.button_pressed = show_velocity
 				if not show_velocity and not show_density: _hide_overlay()
+			KEY_L:
+				_gi_enabled = not _gi_enabled
+				if _gi_sprite:
+					_gi_sprite.visible = _gi_enabled
+			KEY_F12:
+				var img := get_viewport().get_texture().get_image()
+				var path := "user://screenshot_%d.png" % Time.get_ticks_msec()
+				img.save_png(path)
+				print("[Screenshot] Saved: %s" % path)
 			KEY_1: _set_brush(BrushMode.NONE)
 			KEY_2: _set_brush(BrushMode.WALL)
 			KEY_3: _set_brush(BrushMode.ERASE)
