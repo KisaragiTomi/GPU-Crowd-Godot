@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c1jpfuqwka8jv"
+path="res://.godot/imported/cell_blocked.glsl-929ba99773c42938e7ddfee6dfe2a45a.res"
+
+[deps]
+
+source_file="res://shaders/cell_blocked.glsl"
+dest_files=["res://.godot/imported/cell_blocked.glsl-929ba99773c42938e7ddfee6dfe2a45a.res"]
+
+[params]
+

@@ -10,6 +10,7 @@ layout(set = 0, binding = 3, std430) restrict           buffer B3 { float fr[]; 
 layout(set = 0, binding = 4, std430) restrict           buffer B4 { float fl[];        };
 layout(set = 0, binding = 5, std430) restrict           buffer B5 { float fd[];        };
 layout(set = 0, binding = 6, std430) restrict           buffer B6 { float fu[];        };
+layout(set = 0, binding = 7, std430) restrict readonly  buffer B7 { uint compact_tile_coords[]; };
 
 layout(push_constant, std430) uniform Params {
 	int   gw;
@@ -22,7 +23,7 @@ layout(push_constant, std430) uniform Params {
 	float goal_scale;
 	float wall_scale;
 	float max_flux;
-	float _pad0;
+	int   sparse_mode;
 	float _pad1;
 };
 
@@ -30,18 +31,28 @@ shared float s_H[10][10];
 shared uint  s_active;
 
 void main() {
-	int x  = int(gl_GlobalInvocationID.x);
-	int y  = int(gl_GlobalInvocationID.y);
 	int lx = int(gl_LocalInvocationID.x);
 	int ly = int(gl_LocalInvocationID.y);
 	int li = int(gl_LocalInvocationIndex);
 
+	int tile_x, tile_y;
+	if (sparse_mode != 0) {
+		uint packed = compact_tile_coords[gl_WorkGroupID.x];
+		tile_x = int(packed & 0xFFFFu);
+		tile_y = int(packed >> 16u);
+	} else {
+		tile_x = int(gl_WorkGroupID.x);
+		tile_y = int(gl_WorkGroupID.y);
+	}
+
+	int x  = tile_x * 8 + lx;
+	int y  = tile_y * 8 + ly;
+	int ox = tile_x * 8 - 1;
+	int oy = tile_y * 8 - 1;
+
 	float ds = density_scale;
 	float gs = goal_scale;
 	float ws = wall_scale;
-
-	int ox = int(gl_WorkGroupID.x) * 8 - 1;
-	int oy = int(gl_WorkGroupID.y) * 8 - 1;
 
 	if (li == 0) s_active = 0u;
 	barrier();
@@ -59,7 +70,6 @@ void main() {
 	memoryBarrierShared();
 	barrier();
 
-	// Tile has no agents — just decay residual flux, skip full SWE
 	if (s_active == 0u) {
 		if (x < gw && y < gh) {
 			int i = y * gw + x;

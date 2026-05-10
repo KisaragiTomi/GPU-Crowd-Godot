@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ckrb3etbp6w5e"
+path="res://.godot/imported/std_finalize_compact.glsl-56abaa646fe8dad50f315b3b2b206e65.res"
+
+[deps]
+
+source_file="res://shaders/std_finalize_compact.glsl"
+dest_files=["res://.godot/imported/std_finalize_compact.glsl-56abaa646fe8dad50f315b3b2b206e65.res"]
+
+[params]
+

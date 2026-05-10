@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://fifh2wuio67i"
+path="res://.godot/imported/gi_laser_emit.glsl-1f8d4f4e98146f2c01698a5f6aeeb57c.res"
+
+[deps]
+
+source_file="res://shaders/gi_laser_emit.glsl"
+dest_files=["res://.godot/imported/gi_laser_emit.glsl-1f8d4f4e98146f2c01698a5f6aeeb57c.res"]
+
+[params]
+

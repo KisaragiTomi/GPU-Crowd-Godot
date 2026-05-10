@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://obqr7iyky187"
+path="res://.godot/imported/gi_radiance_cascades.glsl-33f1dfbd49195cc2faf699b030557e3d.res"
+
+[deps]
+
+source_file="res://shaders/gi_radiance_cascades.glsl"
+dest_files=["res://.godot/imported/gi_radiance_cascades.glsl-33f1dfbd49195cc2faf699b030557e3d.res"]
+
+[params]
+
