@@ -46,18 +46,32 @@ const int HIT_FLASH_SCALE = 1024;
 
 // 与另一名存活且「正在攻击」的单位同占一个场地格时，本帧不要清除攻击位：
 // combat 先于 steer 执行，否则会在 steer 打上排斥位(bit10)之前就把 bit9 清掉。
+// 已带 bit10 的单位不算：它们不占格，算上会让占格者被墙角里挤不出去的单位钉死在攻击态。
+// cell_start/count 按空间哈希格组织：遍历覆盖该场地格的哈希格（默认 16px/8px 恰为 1 格），再按位置确认同一场地格。
 bool attacking_peer_same_cell(uint self_idx, float px, float py, float ifc) {
 	int my_cx = clamp(int(px * ifc), 0, field_gw - 1);
 	int my_cy = clamp(int(py * ifc), 0, field_gh - 1);
-	int my_ci = my_cy * field_gw + my_cx;
-	int s = int(cell_start_buf[my_ci]);
-	int cnt = int(cell_count_buf[my_ci]);
-	for (int k = 0; k < cnt; k++) {
-		uint j = sorted_idx[s + k];
-		if (j == self_idx) continue;
-		uint ji = agent_info[j];
-		if ((ji & 1u) == 0u) continue;
-		if ((ji & (1u << 9u)) != 0u) return true;
+	// 场地格世界范围 [c*fcs, (c+1)*fcs) 对应的哈希格区间；最末一格还要覆盖被 clamp 进来的越界位置
+	float f2s = sg_inv_cs / ifc;
+	int hx0 = clamp(int(float(my_cx) * f2s), 0, sg_w - 1);
+	int hy0 = clamp(int(float(my_cy) * f2s), 0, sg_h - 1);
+	int hx1 = (my_cx == field_gw - 1) ? sg_w - 1 : clamp(int(ceil(float(my_cx + 1) * f2s)) - 1, hx0, sg_w - 1);
+	int hy1 = (my_cy == field_gh - 1) ? sg_h - 1 : clamp(int(ceil(float(my_cy + 1) * f2s)) - 1, hy0, sg_h - 1);
+	for (int hy = hy0; hy <= hy1; hy++) {
+		for (int hx = hx0; hx <= hx1; hx++) {
+			int ci  = hy * sg_w + hx;
+			int s   = int(cell_start_buf[ci]);
+			int cnt = int(cell_count_buf[ci]);
+			for (int k = 0; k < cnt; k++) {
+				uint j = sorted_idx[s + k];
+				if (j == self_idx) continue;
+				uint ji = agent_info[j];
+				if ((ji & 1u) == 0u || (ji & (1u << 9u)) == 0u || (ji & (1u << 10u)) != 0u) continue;
+				int jx = clamp(int(pos_x[j] * ifc), 0, field_gw - 1);
+				int jy = clamp(int(pos_y[j] * ifc), 0, field_gh - 1);
+				if (jx == my_cx && jy == my_cy) return true;
+			}
+		}
 	}
 	return false;
 }
@@ -116,15 +130,12 @@ void main() {
 				}
 			}
 			if (!enemies_adjacent) {
-				if (damage_acc[i] >= max_hp[i]) {
-					agent_info[i] = agent_info[i] & ~1u;
-					return;
-				}
+				// 远离敌人：跳过索敌，按「没找到敌人」处理（冷却递减、清攻击位、死亡检查）
 				float cd = cooldown[i];
-				if (cd > dt) {
-					cooldown[i] = cd - dt;
-					return;
-				}
+				cooldown[i] = max(cd - dt, -0.15);
+				if (cd < -0.1 && (info & (1u << 9u)) != 0u && !attacking_peer_same_cell(i, px, py, ifc)) agent_info[i] = info & ~(1u << 9u);
+				if (damage_acc[i] >= max_hp[i]) agent_info[i] = agent_info[i] & ~1u;
+				return;
 			}
 		}
 
@@ -177,8 +188,7 @@ void main() {
 			}
 		} else {
 			cooldown[i] = max(my_cd - dt, -0.15);
-			if (my_cd < -0.1 && !attacking_peer_same_cell(i, px, py, ifc))
-				agent_info[i] = info & ~(1u << 9u);
+			if (my_cd < -0.1 && (info & (1u << 9u)) != 0u && !attacking_peer_same_cell(i, px, py, ifc)) agent_info[i] = info & ~(1u << 9u);
 		}
 	}
 

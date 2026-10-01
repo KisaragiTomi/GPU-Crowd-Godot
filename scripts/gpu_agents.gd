@@ -42,8 +42,6 @@ var buf_faction_presence: RID
 var buf_corpse_map: RID
 var buf_cell_attacker: RID
 var buf_cell_blocked: RID
-var buf_disp_vx: RID
-var buf_disp_vy: RID
 
 # MultiMesh GPU build
 var buf_mm_disp_x: RID
@@ -65,7 +63,6 @@ var shd_density: RID;      var pip_density: RID
 var shd_steer: RID;        var pip_steer: RID
 var shd_combat: RID;       var pip_combat: RID
 var shd_cell_blocked: RID; var pip_cell_blocked: RID
-var shd_disp_flow: RID;   var pip_disp_flow: RID
 var shd_build_mm: RID;    var pip_build_mm: RID
 
 # Uniform sets
@@ -78,7 +75,6 @@ var us_steer: Array[RID]
 var us_steer_s1: RID
 var us_combat: Array[RID]
 var us_cell_blocked: RID
-var us_disp_flow: RID
 var us_build_mm: Array[RID]
 
 var agent_groups: int
@@ -115,6 +111,7 @@ func _init(rendering_device: RenderingDevice, max_n: int, cell_size: float, worl
 
 	_create_buffers()
 	_load_shaders()
+	_create_laser_compact()
 
 
 func _create_buffers() -> void:
@@ -151,8 +148,8 @@ func _create_buffers() -> void:
 	buf_mm_disp_y = rd.storage_buffer_create(af, zf)
 	buf_mm_fac_colors = rd.storage_buffer_create(32 * 16)  # 32 vec4
 	buf_mm_out = rd.storage_buffer_create(max_agents * 12 * 4, _zero_bytes(max_agents * 12))
-	var z4 := PackedByteArray(); z4.resize(4); z4.fill(0)
-	buf_mm_alive = rd.storage_buffer_create(4, z4)
+	var z16 := PackedByteArray(); z16.resize(16); z16.fill(0)
+	buf_mm_alive = rd.storage_buffer_create(16, z16)  # [alive, laser_count, 0, 0]
 
 	# Small tables (32 uint each = 128 bytes)
 	var z32 := _zero_bytes(32)
@@ -169,7 +166,6 @@ func _load_shaders() -> void:
 	shd_steer   = _mk_shader("res://shaders/agent_steer.glsl")
 	shd_combat       = _mk_shader("res://shaders/agent_combat.glsl")
 	shd_cell_blocked = _mk_shader("res://shaders/cell_blocked.glsl")
-	shd_disp_flow    = _mk_shader("res://shaders/disp_flow.glsl")
 	shd_build_mm     = _mk_shader("res://shaders/build_multimesh.glsl")
 	pip_clear   = rd.compute_pipeline_create(shd_clear)
 	pip_count   = rd.compute_pipeline_create(shd_count)
@@ -179,7 +175,6 @@ func _load_shaders() -> void:
 	pip_steer   = rd.compute_pipeline_create(shd_steer)
 	pip_combat       = rd.compute_pipeline_create(shd_combat)
 	pip_cell_blocked = rd.compute_pipeline_create(shd_cell_blocked)
-	pip_disp_flow    = rd.compute_pipeline_create(shd_disp_flow)
 	pip_build_mm     = rd.compute_pipeline_create(shd_build_mm)
 
 
@@ -223,11 +218,6 @@ func set_field_buffers(out_vx: RID, out_vy: RID, terrain: RID, goal_dist: RID,
 
 	# Cell blocked map: per-cell bitmask of blocked alliance groups
 	buf_cell_blocked = rd.storage_buffer_create(_field_cell_count * 4, zfc)
-
-	# DISP flow field: per-cell * max_groups velocity
-	var zfg := _zero_bytes(_field_cell_count * max_groups)
-	buf_disp_vx = rd.storage_buffer_create(_field_cell_count * max_groups * 4, zfg)
-	buf_disp_vy = rd.storage_buffer_create(_field_cell_count * max_groups * 4, zfg)
 
 
 func build_uniform_sets() -> void:
@@ -296,8 +286,7 @@ func build_uniform_sets() -> void:
 		_u(5, buf_cell_attacker),
 		_u(6, buf_cooldown),
 		_u(7, buf_cell_blocked),
-		_u(8, buf_disp_vx),
-		_u(9, buf_disp_vy),
+		_u(8, buf_faction_presence),
 	], shd_steer, 1)
 
 	# cell_blocked pass
@@ -308,18 +297,6 @@ func build_uniform_sets() -> void:
 		_u(3, _buf_terrain),
 		_u(4, buf_cell_blocked),
 	], shd_cell_blocked, 0)
-
-	# disp_flow pass
-	us_disp_flow = rd.uniform_set_create([
-		_u(0, buf_cell_blocked),
-		_u(1, _buf_out_vx),
-		_u(2, _buf_out_vy),
-		_u(3, buf_disp_vx),
-		_u(4, buf_disp_vy),
-		_u(5, buf_cell_attacker),
-		_u(6, buf_faction_presence),
-		_u(7, buf_fac_to_group),
-	], shd_disp_flow, 0)
 
 	# build_multimesh pass (double-buffered: us_build_mm[b] reads from pos[1-b])
 	us_build_mm = [RID(), RID()]
@@ -332,6 +309,8 @@ func build_uniform_sets() -> void:
 			_u(6, buf_mm_disp_x),     _u(7, buf_mm_disp_y),
 			_u(8, buf_mm_out),        _u(9, buf_mm_alive),
 		], shd_build_mm, 0)
+
+	_build_select_inspect()
 
 
 func _u(binding: int, buf: RID) -> RDUniform:
@@ -405,22 +384,6 @@ func readback_agent_info() -> PackedInt32Array:
 
 func readback_damage_acc() -> PackedInt32Array:
 	return rd.buffer_get_data(buf_damage_acc).to_int32_array()
-
-
-func readback_cell_attacker() -> PackedInt32Array:
-	return rd.buffer_get_data(buf_cell_attacker).to_int32_array()
-
-
-func readback_cell_blocked() -> PackedInt32Array:
-	return rd.buffer_get_data(buf_cell_blocked).to_int32_array()
-
-
-func readback_laser_lines(count: int) -> PackedFloat32Array:
-	return rd.buffer_get_data(buf_laser_lines, 0, count * 4 * 4).to_float32_array()
-
-
-func readback_laser_ttl(count: int) -> PackedFloat32Array:
-	return rd.buffer_get_data(buf_laser_ttl, 0, count * 4).to_float32_array()
 
 
 func clear_laser_events() -> void:
@@ -533,18 +496,6 @@ func dispatch_cell_blocked(cl: int) -> void:
 	rd.compute_list_dispatch(cl, ceili(float(_field_gw) / 8.0), ceili(float(_field_gh) / 8.0), 1)
 
 
-func dispatch_disp_flow(cl: int, num_groups: int, num_factions: int) -> void:
-	var p := PackedByteArray(); p.resize(16)
-	p.encode_s32(0, _field_gw)
-	p.encode_s32(4, _field_gh)
-	p.encode_s32(8, num_groups)
-	p.encode_s32(12, num_factions)
-	rd.compute_list_bind_compute_pipeline(cl, pip_disp_flow)
-	rd.compute_list_bind_uniform_set(cl, us_disp_flow, 0)
-	rd.compute_list_set_push_constant(cl, p, 16)
-	rd.compute_list_dispatch(cl, ceili(float(_field_gw) / 8.0), ceili(float(_field_gh) / 8.0), num_groups)
-
-
 func dispatch_build_mm(cl: int, lerp_t: float) -> void:
 	var p := PackedByteArray(); p.resize(16)
 	p.encode_s32(0, agent_count)
@@ -558,16 +509,8 @@ func dispatch_build_mm(cl: int, lerp_t: float) -> void:
 
 
 func reset_alive_counter() -> void:
-	var z := PackedByteArray(); z.resize(4); z.fill(0)
-	rd.buffer_update(buf_mm_alive, 0, 4, z)
-
-
-func readback_mm_buf(count: int) -> PackedFloat32Array:
-	return rd.buffer_get_data(buf_mm_out, 0, count * 12 * 4).to_float32_array()
-
-
-func readback_alive_count() -> int:
-	return rd.buffer_get_data(buf_mm_alive).to_int32_array()[0]
+	var z := PackedByteArray(); z.resize(16); z.fill(0)
+	rd.buffer_update(buf_mm_alive, 0, 16, z)
 
 
 func swap_buffers() -> void:
@@ -625,6 +568,70 @@ func dispatch_steer(cl: int, dt: float, sep_r: float, sep_str: float,
 	rd.compute_list_dispatch(cl, _live_groups(), 1, 1)
 
 
+# ── Laser compaction ─────────────────────────────────────────────────────
+
+const LASER_CAP := 8192  # 每帧最多绘制的激光条数，超出的只是不画（GI 不受影响）
+
+var shd_laser_compact: RID
+var pip_laser_compact: RID
+var buf_laser_compact: RID  # [点区 LASER_CAP×16 B][颜色区 LASER_CAP×16 B]
+var us_laser_compact: RID
+
+
+func _create_laser_compact() -> void:
+	shd_laser_compact = _mk_shader("res://shaders/laser_compact.glsl")
+	pip_laser_compact = rd.compute_pipeline_create(shd_laser_compact)
+	buf_laser_compact = rd.storage_buffer_create(LASER_CAP * 32, _zero_bytes(LASER_CAP * 8))
+	us_laser_compact = rd.uniform_set_create([
+		_u(0, buf_agent_info),  _u(1, buf_mm_fac_colors),
+		_u(2, buf_laser_lines), _u(3, buf_laser_ttl),
+		_u(4, buf_mm_alive),    _u(5, buf_laser_compact),
+	], shd_laser_compact, 0)
+
+
+func dispatch_laser_compact(cl: int, laser_life: float) -> void:
+	var p := PackedByteArray(); p.resize(16)
+	p.encode_s32(0, agent_count)
+	p.encode_u32(4, LASER_CAP)
+	p.encode_float(8, laser_life)
+	p.encode_float(12, 0.0)
+	rd.compute_list_bind_compute_pipeline(cl, pip_laser_compact)
+	rd.compute_list_bind_uniform_set(cl, us_laser_compact, 0)
+	rd.compute_list_set_push_constant(cl, p, 16)
+	rd.compute_list_dispatch(cl, _live_groups(), 1, 1)
+
+
+# ── 每帧显示数据回读 ─────────────────────────────────────────────────────
+# build_mm / laser_compact 的结果随主提交异步回读：走常驻的下载暂存环，数据在随后的 sync() 里到达。
+# buffer_get_data 每次都临时分配一整块主机可见内存再 flush + stall，内存紧张时会卡几十到几百 ms。
+
+var _frame_raw := {}  # "mm" / "counters" / "lasers" -> 到达的 PackedByteArray
+
+
+## compute_list_end 之后、submit 之前调用：登记 mm 前 count 个实例、[alive, laser_count]、压缩激光整块
+func request_frame_readback(count: int) -> void:
+	_frame_raw = {}
+	rd.buffer_get_data_async(buf_mm_out, _on_frame_data.bind("mm"), 0, count * 48)
+	rd.buffer_get_data_async(buf_mm_alive, _on_frame_data.bind("counters"), 0, 8)
+	rd.buffer_get_data_async(buf_laser_compact, _on_frame_data.bind("lasers"), 0, LASER_CAP * 32)
+
+
+func _on_frame_data(data: PackedByteArray, key: String) -> void:
+	_frame_raw[key] = data
+
+
+## sync() 之后调用：取出到达的数据 {mm: count×48 B, alive, laser_count（可能超过 LASER_CAP）,
+## lasers: 激光整块 LASER_CAP×32 B}；未到达或大小不符（理论上不会）时返回空字典
+func take_frame_readback(count: int) -> Dictionary:
+	var raw := _frame_raw
+	_frame_raw = {}
+	var mm: PackedByteArray = raw.get("mm", PackedByteArray())
+	var cnt: PackedByteArray = raw.get("counters", PackedByteArray())
+	var lasers: PackedByteArray = raw.get("lasers", PackedByteArray())
+	if mm.size() != count * 48 or cnt.size() != 8 or lasers.size() != LASER_CAP * 32: return {}
+	return {"mm": mm, "alive": cnt.decode_s32(0), "laser_count": cnt.decode_s32(4), "lasers": lasers}
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 func _live_groups() -> int:
@@ -660,6 +667,89 @@ func _zero_bytes(count: int) -> PackedByteArray:
 	return a.to_byte_array()
 
 
+# ── Selection inspect ────────────────────────────────────────────────────
+# 选中 agent 的 GPU 查询（shaders/select_inspect.glsl）：最近敌人、自身 info/damage/位置、
+# 所在格的 blocker。结果只有 SEL_Q_WORDS 个 uint，随所在的 submit 异步回读（几十字节）。
+
+const SEL_Q_WORDS := 16
+const SEL_Q_NONE := 0xFFFFFFFF
+
+var shd_sel_inspect: RID
+var pip_sel_inspect: RID
+var buf_sel_q: RID
+var us_sel_inspect: Array[RID]  # [b] 读 pos[1-b]（同 us_build_mm）
+var _sel_q_raw := PackedByteArray()
+
+
+func _build_select_inspect() -> void:
+	shd_sel_inspect = _mk_shader("res://shaders/select_inspect.glsl")
+	pip_sel_inspect = rd.compute_pipeline_create(shd_sel_inspect)
+	buf_sel_q = rd.storage_buffer_create(SEL_Q_WORDS * 4, _zero_bytes(SEL_Q_WORDS))
+	us_sel_inspect = [RID(), RID()]
+	for b in range(2):
+		var w := 1 - b
+		us_sel_inspect[b] = rd.uniform_set_create([
+			_u(0, buf_pos_x[w]),   _u(1, buf_pos_y[w]),
+			_u(2, buf_agent_info), _u(3, buf_damage_acc),
+			_u(4, buf_alliance),   _u(5, buf_cell_attacker),
+			_u(6, buf_sel_q),
+		], shd_sel_inspect, 0)
+
+
+## 记录查询的 4 个 pass（清哨兵 → 最小距离² → 最小下标 → 汇总），pass 之间加 barrier。
+## after_swap=false：主 compute list 里 steer 之后、swap_buffers 之前，读 steer 本帧输出 pos[1-cur]；
+## after_swap=true：swap 之后单独派发，读当前位置 pos[cur]。两者读到的都是 swap 后的 pos[cur]。
+func dispatch_select_inspect(cl: int, sel: int, after_swap: bool = false) -> void:
+	var p := PackedByteArray(); p.resize(32)
+	p.encode_s32(0, agent_count)
+	p.encode_s32(4, sel)
+	p.encode_s32(12, _field_gw)
+	p.encode_s32(16, _field_gh)
+	p.encode_float(20, _field_cs)
+	rd.compute_list_bind_compute_pipeline(cl, pip_sel_inspect)
+	rd.compute_list_bind_uniform_set(cl, us_sel_inspect[1 - cur if after_swap else cur], 0)
+	for mode in range(4):
+		if mode > 0:
+			rd.compute_list_add_barrier(cl)
+		p.encode_s32(8, mode)
+		rd.compute_list_set_push_constant(cl, p, 32)
+		rd.compute_list_dispatch(cl, _live_groups() if mode == 1 or mode == 2 else 1, 1, 1)
+
+
+## compute_list_end 之后、submit 之前调用：登记异步回读，数据在随后的 sync() 里到达，
+## 不像 buffer_get_data 那样额外 flush + stall 一次。
+func request_select_inspect() -> void:
+	_sel_q_raw = PackedByteArray()
+	rd.buffer_get_data_async(buf_sel_q, _on_select_inspect_data, 0, SEL_Q_WORDS * 4)
+
+
+func _on_select_inspect_data(data: PackedByteArray) -> void:
+	_sel_q_raw = data
+
+
+## sync() 之后调用：解码查询结果（数据未到达时返回空字典）。ne / blocker 为 -1 表示没有。
+func take_select_inspect(sel: int) -> Dictionary:
+	var q := _sel_q_raw
+	_sel_q_raw = PackedByteArray()
+	if q.size() < SEL_Q_WORDS * 4:
+		return {}
+	var ne := q.decode_u32(4)
+	var blk := q.decode_u32(40)
+	return {
+		"sel": sel,
+		"info": q.decode_s32(8),
+		"dmg": q.decode_s32(12),
+		"pos": Vector2(q.decode_float(16), q.decode_float(20)),
+		"ne": -1 if ne == SEL_Q_NONE else ne,
+		"ne_dsq": q.decode_float(0),
+		"ne_info": q.decode_s32(24),
+		"ne_pos": Vector2(q.decode_float(28), q.decode_float(32)),
+		"cell": q.decode_u32(36),
+		"blocker": -1 if blk == SEL_Q_NONE else blk,
+		"blk_pos": Vector2(q.decode_float(44), q.decode_float(48)),
+	}
+
+
 # ── Cleanup ──────────────────────────────────────────────────────────────
 
 func cleanup() -> void:
@@ -668,19 +758,25 @@ func cleanup() -> void:
 	var _free := func(rid: RID) -> void:
 		if rid.is_valid():
 			rd.free_rid(rid)
-	for rid in [us_clear, us_prefix, us_steer_s1, us_cell_blocked, us_disp_flow]:
+	# 选中查询：uniform set 依赖 pos/info 等缓冲，要在它们释放前先释放
+	for rid in us_sel_inspect + [pip_sel_inspect, shd_sel_inspect, buf_sel_q]:
+		_free.call(rid)
+	for rid in [us_clear, us_prefix, us_steer_s1, us_cell_blocked]:
 		_free.call(rid)
 	for arr in [us_count, us_scatter, us_density, us_steer, us_combat, us_build_mm]:
 		for rid in arr:
 			_free.call(rid)
 	for pip in [pip_clear, pip_count, pip_prefix, pip_scatter,
-				pip_density, pip_steer, pip_combat, pip_cell_blocked, pip_disp_flow,
+				pip_density, pip_steer, pip_combat, pip_cell_blocked,
 				pip_build_mm]:
 		_free.call(pip)
 	for shd in [shd_clear, shd_count, shd_prefix, shd_scatter,
-				shd_density, shd_steer, shd_combat, shd_cell_blocked, shd_disp_flow,
+				shd_density, shd_steer, shd_combat, shd_cell_blocked,
 				shd_build_mm]:
 		_free.call(shd)
+	# uniform set 须先于其引用的 buffer 释放
+	for rid in [us_laser_compact, pip_laser_compact, shd_laser_compact, buf_laser_compact]:
+		_free.call(rid)
 	for arr in [buf_pos_x, buf_pos_y, buf_vel_x, buf_vel_y]:
 		for rid in arr:
 			_free.call(rid)
@@ -689,7 +785,7 @@ func cleanup() -> void:
 				buf_regen_rate, buf_cooldown, buf_atk_range, buf_atk_damage,
 				buf_laser_lines, buf_laser_ttl, buf_hit_flash,
 				buf_faction_presence, buf_corpse_map, buf_cell_attacker,
-				buf_cell_blocked, buf_disp_vx, buf_disp_vy,
+				buf_cell_blocked,
 				buf_mm_disp_x, buf_mm_disp_y, buf_mm_fac_colors,
 				buf_mm_out, buf_mm_alive,
 				buf_alliance, buf_fac_to_group]:

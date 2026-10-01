@@ -25,8 +25,7 @@ layout(set = 1, binding = 4, std430) restrict          buffer S1B4 { uint  corps
 layout(set = 1, binding = 5, std430) restrict          buffer S1B5 { uint  cell_attacker[]; };
 layout(set = 1, binding = 6, std430) restrict          buffer S1B6 { float cooldown_buf[];  };
 layout(set = 1, binding = 7, std430) restrict readonly buffer S1B7 { uint  cell_blocked[];  };
-layout(set = 1, binding = 8, std430) restrict readonly buffer S1B8 { float disp_vx[];      };
-layout(set = 1, binding = 9, std430) restrict readonly buffer S1B9 { float disp_vy[];      };
+layout(set = 1, binding = 8, std430) restrict readonly buffer S1B8 { uint  faction_presence[]; };
 
 layout(push_constant, std430) uniform Params {
 	int   agent_count;    // 0
@@ -54,6 +53,49 @@ uint pcg(uint v) {
 }
 
 float rand01(uint seed) { return float(pcg(seed)) / 4294967295.0; }
+
+// 被挤开 agent 的逃逸方向（原 disp_flow pass 的按需版本，只算自己所在格）：
+// 7×7 内最近的"非墙、无存活攻击者、无敌方 presence"格；找不到则取逆目标速度方向
+vec2 displaced_dir(int fx, int fy, uint group) {
+	int gi = fy * field_gw + fx;
+	if (cell_blocked[gi] == 0xFFFFFFFFu) return vec2(0.0);
+
+	uint enemy_fac_mask = 0u;
+	for (uint f = 0u; f < 32u; f++) enemy_fac_mask |= uint(fac_to_group[f] != group) << f;
+
+	const int R = 3;
+	float best_dsq = 1e10;
+	float best_dx = 0.0, best_dy = 0.0;
+	for (int dy = -R; dy <= R; dy++) {
+		int ny = fy + dy;
+		if (ny < 0 || ny >= field_gh) continue;
+		for (int dx = -R; dx <= R; dx++) {
+			if (dx == 0 && dy == 0) continue;
+			int nx = fx + dx;
+			if (nx < 0 || nx >= field_gw) continue;
+			int ni = ny * field_gw + nx;
+
+			// cell_blocked 非 0 = 墙或被存活攻击者占用（steer 前算好；cell_attacker 在本 pass 内会被 atomic 改写）
+			if (cell_blocked[ni] != 0u) continue;
+			if ((faction_presence[ni] & enemy_fac_mask) != 0u) continue;
+
+			float dsq = float(dx * dx + dy * dy);
+			if (dsq < best_dsq) {
+				best_dsq = dsq;
+				best_dx = float(dx);
+				best_dy = float(dy);
+			}
+		}
+	}
+	if (best_dsq < 1e9) return vec2(best_dx, best_dy) * inversesqrt(best_dsq);
+
+	int goal_idx = int(group) * field_gw * field_gh + gi;
+	float sdx = -out_vx_all[goal_idx];
+	float sdy = -out_vy_all[goal_idx];
+	float slen = sqrt(sdx * sdx + sdy * sdy);
+	if (slen > 0.01) return vec2(sdx, sdy) / slen;
+	return vec2(0.0);
+}
 
 void main() {
 	uint i = gl_GlobalInvocationID.x;
@@ -410,11 +452,9 @@ void main() {
 			}
 
 			float disp_speed = 60.0;
-			int dfi = int(group) * field_gw * field_gh
-			        + clamp(int(py * ifc), 0, field_gh - 1) * field_gw
-			        + clamp(int(px * ifc), 0, field_gw - 1);
-			float dx = disp_vx[dfi];
-			float dy = disp_vy[dfi];
+			vec2 ddir = displaced_dir(clamp(int(px * ifc), 0, field_gw - 1), clamp(int(py * ifc), 0, field_gh - 1), group);
+			float dx = ddir.x;
+			float dy = ddir.y;
 			float dlen = sqrt(dx * dx + dy * dy);
 			if (dlen < 0.01) {
 				float drift_angle = rand01(i * 997u) * 6.28318;

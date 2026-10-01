@@ -34,10 +34,12 @@ class LaserOverlay:
 	extends Node2D
 
 	var sim
+	var width := 1.0
 
+	# 顶点色 alpha = fade，与 self_modulate.a 相乘得到本层的 alpha
 	func _draw() -> void:
-		if sim != null:
-			sim._draw_lasers(self)
+		if sim != null and not sim._laser_points.is_empty():
+			draw_multiline_colors(sim._laser_points, sim._laser_colors, width, true)
 
 
 const MAX_AGENTS := 100000
@@ -107,6 +109,12 @@ var _ov_uset: RID
 var _ov_buf_rgba: RID
 var _ov_sprite: Sprite2D
 var _ov_active_mode := -1
+var _ov_raw := PackedByteArray()  # 异步回读到的 density / velocity 叠加 RGBA
+# 选中 agent 所在 group 的阻挡格叠加（mode 2），独立缓冲 / uniform set / 纹理
+var _blk_uset: RID
+var _blk_buf_rgba: RID
+var _blk_tex: CanvasTexture
+var _blk_raw := PackedByteArray()  # 异步回读到的 RGBA
 
 var swe_accum := 0.0
 var swe_interval := 0.033
@@ -131,7 +139,6 @@ var perf_mm_readback_info := 0.0
 var perf_mm_readback_dmg := 0.0
 var perf_mm_loop := 0.0
 var perf_mm_set_buffer := 0.0
-var perf_goal := 0.0
 var perf_alpha := 0.15
 var perf_peak_total := 0.0
 var perf_peak_detail := ""
@@ -140,6 +147,7 @@ var _last_frame_usec := 0
 var alive_count := 0
 var selected_agent: int = -1
 var nearest_enemy: int = -1
+var sel_query := {}  # 选中 agent 的 GPU 查询结果（agents.take_select_inspect），sel == selected_agent 时有效
 var select_label: Label
 
 var multi_mesh: MultiMesh
@@ -163,8 +171,6 @@ var group_goals: Array
 var _goal_rr_idx := 0
 var cached_info := PackedInt32Array()
 var cached_damage := PackedInt32Array()
-var cached_cell_atk := PackedInt32Array()
-var cached_cell_blocked := PackedInt32Array()
 
 var _agent_debounce_timer: Timer
 var _agent_pending_count := -1
@@ -179,10 +185,11 @@ var _gi_tex_w := 400
 var _gi_tex_h := 240
 var _gi_precision := 0.50
 var _gi_emit_strength := GI_AGENT_EMIT_STRENGTH
-var _laser_overlay: LaserOverlay
-var cached_laser_lines := PackedFloat32Array()
-var cached_laser_ttl := PackedFloat32Array()
-var _laser_any_active := false
+var _laser_layers: Array[LaserOverlay] = []  # soft / glow / core
+var _laser_count := 0  # 本帧 GPU 压缩出的激光数（可能超过 LASER_CAP）
+var _laser_raw := PackedByteArray()  # 本帧到达的压缩激光整块（agents.take_frame_readback）
+var _laser_points := PackedVector2Array()
+var _laser_colors := PackedColorArray()
 
 # HUD
 var fps_label: Label
@@ -304,17 +311,27 @@ func _update_gi_buffers() -> void:
 
 
 func _setup_laser_overlay() -> void:
-	if _laser_overlay != null:
+	if not _laser_layers.is_empty():
 		return
-	_laser_overlay = LaserOverlay.new()
-	_laser_overlay.sim = self
-	_laser_overlay.z_index = 4
-	_laser_overlay.visibility_layer = RENDER_LAYER_WORLD
 	var mat := CanvasItemMaterial.new()
 	mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
-	_laser_overlay.material = mat
-	_laser_overlay.visible = false
-	add_child(_laser_overlay)
+	# [宽度, alpha]：加法混合与绘制顺序无关，三层分开画等价于逐条交错画
+	var layer_cfgs := [
+		[RANGED_LASER_VIS_SOFT_WIDTH, 0.055],
+		[RANGED_LASER_VIS_GLOW_WIDTH, 0.16],
+		[RANGED_LASER_VIS_WIDTH, 0.62],
+	]
+	for cfg in layer_cfgs:
+		var layer := LaserOverlay.new()
+		layer.sim = self
+		layer.width = cfg[0]
+		layer.self_modulate = Color(1.0, 1.0, 1.0, cfg[1])
+		layer.z_index = 4
+		layer.visibility_layer = RENDER_LAYER_WORLD
+		layer.material = mat
+		layer.visible = false
+		add_child(layer)
+		_laser_layers.append(layer)
 
 
 func _get_gi_texture_size() -> Vector2i:
@@ -676,16 +693,19 @@ func _setup_overlay() -> void:
 		u.add_id(buf)
 		return u
 
-	_ov_uset = rd.uniform_set_create([
-		_u.call(0, field.buf_density),
-		_u.call(1, field.buf_terrain),
-		_u.call(2, field.buf_goal_dist),
-		_u.call(3, agents.buf_cell_blocked),
-		_u.call(4, _ov_buf_rgba),
-		_u.call(5, field.buf_out_vx),
-		_u.call(6, field.buf_out_vy),
-		_u.call(7, agents.buf_faction_presence),
-	], _ov_shd, 0)
+	var _ov_uniforms := func(out_buf: RID) -> Array[RDUniform]:
+		return [
+			_u.call(0, field.buf_density),
+			_u.call(1, field.buf_terrain),
+			_u.call(2, field.buf_goal_dist),
+			_u.call(3, agents.buf_cell_blocked),
+			_u.call(4, out_buf),
+			_u.call(5, field.buf_out_vx),
+			_u.call(6, field.buf_out_vy),
+			_u.call(7, agents.buf_faction_presence),
+		]
+
+	_ov_uset = rd.uniform_set_create(_ov_uniforms.call(_ov_buf_rgba), _ov_shd, 0)
 
 	_ov_sprite = Sprite2D.new()
 	_ov_sprite.centered = false
@@ -696,8 +716,38 @@ func _setup_overlay() -> void:
 	_ov_sprite.visible = false
 	add_child(_ov_sprite)
 
+	# 阻挡格叠加：同一 shader 的 mode 2，独立输出缓冲 / uniform set / 纹理，可与 density/velocity 同时显示。
+	# 在 _draw 里原来逐格画的位置整张画出，层级不变（选中圈之下、agent 之下）；CanvasTexture 指定最近邻过滤
+	_blk_buf_rgba = rd.storage_buffer_create(n_bytes, z)
+	_blk_uset = rd.uniform_set_create(_ov_uniforms.call(_blk_buf_rgba), _ov_shd, 0)
+	_blk_tex = CanvasTexture.new()
+	_blk_tex.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+
 
 func _dispatch_overlay(mode: int, param_i: int = 0, param_f: float = 0.0, group_off: int = 0, fac_mask: int = 0) -> void:
+	var cl := rd.compute_list_begin()
+	_record_overlay(cl, _ov_uset, mode, param_i, param_f, group_off, fac_mask)
+	rd.compute_list_end()
+	# 同一次提交里异步回读，数据在 sync() 里到达
+	_ov_raw = PackedByteArray()
+	rd.buffer_get_data_async(_ov_buf_rgba, _on_overlay_data, 0, grid_width * grid_height * 4)
+	rd.submit()
+	rd.sync()
+
+	var raw := _ov_raw
+	_ov_raw = PackedByteArray()
+	if raw.size() != grid_width * grid_height * 4: return  # 数据缺失（理论上不会）：保留上一次的叠加
+	_ov_sprite.texture = _overlay_texture(_ov_sprite.texture, raw)
+	_ov_sprite.visible = true
+	_ov_active_mode = mode
+
+
+func _on_overlay_data(data: PackedByteArray) -> void:
+	_ov_raw = data
+
+
+# 在 cl 里记录一次 build_overlay.glsl，输出到 uset 绑定的缓冲（binding 4）
+func _record_overlay(cl: int, uset: RID, mode: int, param_i: int = 0, param_f: float = 0.0, group_off: int = 0, fac_mask: int = 0) -> void:
 	var p := PackedByteArray(); p.resize(32)
 	p.encode_s32(0, grid_width)
 	p.encode_s32(4, grid_height)
@@ -707,20 +757,19 @@ func _dispatch_overlay(mode: int, param_i: int = 0, param_f: float = 0.0, group_
 	p.encode_s32(20, group_off)
 	p.encode_s32(24, fac_mask)
 
-	var cl := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cl, _ov_pip)
-	rd.compute_list_bind_uniform_set(cl, _ov_uset, 0)
+	rd.compute_list_bind_uniform_set(cl, uset, 0)
 	rd.compute_list_set_push_constant(cl, p, 32)
 	rd.compute_list_dispatch(cl, ceili(float(grid_width) / 8.0), ceili(float(grid_height) / 8.0), 1)
-	rd.compute_list_end()
-	rd.submit()
-	rd.sync()
 
-	var raw := rd.buffer_get_data(_ov_buf_rgba, 0, grid_width * grid_height * 4)
+
+# 用叠加的 RGBA 数据更新纹理：已有 ImageTexture 就 update() 复用，只在第一次新建
+func _overlay_texture(tex: ImageTexture, raw: PackedByteArray) -> ImageTexture:
 	var img := Image.create_from_data(grid_width, grid_height, false, Image.FORMAT_RGBA8, raw)
-	_ov_sprite.texture = ImageTexture.create_from_image(img)
-	_ov_sprite.visible = true
-	_ov_active_mode = mode
+	if tex == null:
+		return ImageTexture.create_from_image(img)
+	tex.update(img)
+	return tex
 
 
 func _hide_overlay() -> void:
@@ -732,6 +781,10 @@ func _hide_overlay() -> void:
 func _cleanup_overlay() -> void:
 	if rd == null:
 		return
+	# _blk_uset 依赖 _ov_shd，先于下面的释放
+	for rid in [_blk_uset, _blk_buf_rgba]:
+		if rid.is_valid():
+			rd.free_rid(rid)
 	for rid in [_ov_uset, _ov_pip, _ov_shd, _ov_buf_rgba]:
 		if rid.is_valid():
 			rd.free_rid(rid)
@@ -750,16 +803,17 @@ func _make_circle_texture(radius_px: int) -> ImageTexture:
 	return ImageTexture.create_from_image(img)
 
 
+# 用随主提交 sync() 到达的数据（agents.request_frame_readback）更新 MultiMesh 和计数
 func _sync_multimesh_gpu() -> void:
 	var ta := Time.get_ticks_usec()
-	mm_buf = agents.readback_mm_buf(agent_count)
+	var frame := agents.take_frame_readback(agent_count)
+	if frame.is_empty(): return  # 数据缺失（理论上不会）：保留上一帧的显示
+	var mm_raw: PackedByteArray = frame.mm
+	mm_buf = mm_raw.to_float32_array()
+	alive_count = frame.alive
+	_laser_count = frame.laser_count
+	_laser_raw = frame.lasers
 	var tb := Time.get_ticks_usec()
-	alive_count = agents.readback_alive_count()
-	if selected_agent >= 0:
-		cached_info = agents.readback_agent_info()
-		cached_damage = agents.readback_damage_acc()
-		cached_cell_atk = agents.readback_cell_attacker()
-		cached_cell_blocked = agents.readback_cell_blocked()
 	multi_mesh.set_buffer(mm_buf)
 	var tc := Time.get_ticks_usec()
 	var alpha := perf_alpha
@@ -775,9 +829,6 @@ func _sync_multimesh_cpu() -> void:
 	var tb := Time.get_ticks_usec()
 	cached_damage = agents.readback_damage_acc()
 	var tc := Time.get_ticks_usec()
-	if selected_agent >= 0:
-		cached_cell_atk = agents.readback_cell_attacker()
-		cached_cell_blocked = agents.readback_cell_blocked()
 	alive_count = 0
 	var stride := 12
 	var buf_size := agent_count * stride
@@ -827,20 +878,22 @@ func _sync_multimesh_cpu() -> void:
 
 
 func _sync_laser_overlay() -> void:
-	if _laser_overlay == null:
+	if _laser_layers.is_empty():
 		return
-	cached_laser_ttl = agents.readback_laser_ttl(agent_count)
-	_laser_any_active = false
-	for ttl in cached_laser_ttl:
-		if ttl > 0.0:
-			_laser_any_active = true
-			break
-	if _laser_any_active:
-		cached_laser_lines = agents.readback_laser_lines(agent_count)
-		_laser_overlay.visible = true
-		_laser_overlay.queue_redraw()
+	var active := _laser_count > 0
+	if active:
+		# 从到达的激光整块切出前 n 条：点区 [0, n×16)，颜色区从 LASER_CAP×16 起 n×16 字节
+		var n := mini(_laser_count, GPUAgents.LASER_CAP)
+		var col_off := GPUAgents.LASER_CAP * 16
+		_laser_points = _laser_raw.slice(0, n * 16).to_vector2_array()
+		_laser_colors = _laser_raw.slice(col_off, col_off + n * 16).to_color_array()
 	else:
-		_laser_overlay.visible = false
+		_laser_points = PackedVector2Array()
+		_laser_colors = PackedColorArray()
+	for layer in _laser_layers:
+		layer.visible = active
+		if active:
+			layer.queue_redraw()
 
 
 func _pick_agent(world_pos: Vector2) -> void:
@@ -856,29 +909,66 @@ func _pick_agent(world_pos: Vector2) -> void:
 			best_dsq = dsq
 			best = idx
 	selected_agent = best
+	_refresh_selection()
 	_update_select_label()
 	queue_redraw()
+
+
+# 选中改变后立刻查询一次（暂停时也能正确显示）；之后每帧由 _process 在主 compute list 里查询
+func _refresh_selection() -> void:
+	sel_query = {}
+	if selected_agent < 0 or selected_agent >= agent_count:
+		return
+	var cl := rd.compute_list_begin()
+	_record_select(cl, true)
+	rd.compute_list_end()
+	_request_select_readback()
+	rd.submit()
+	rd.sync()
+	_apply_select_readback()
+
+
+# 在 cl 里记录选中查询（select_inspect 的 4 个小 pass）+ 阻挡格叠加（build_overlay mode 2）
+func _record_select(cl: int, after_swap: bool) -> void:
+	agents.dispatch_select_inspect(cl, selected_agent, after_swap)
+	# 阵营位在 GPU 上不会改变；记录时本次查询结果还没出来，直接用 CPU 侧的阵营
+	var sel_grp := faction_to_group[agent_factions[selected_agent]]
+	_record_overlay(cl, _blk_uset, 2, 1 << sel_grp)
+
+
+# compute_list_end 之后、submit 之前：登记查询结果（几十字节）和阻挡格叠加的异步回读，
+# 数据在随后的 sync() 里到达，不额外 flush + stall
+func _request_select_readback() -> void:
+	agents.request_select_inspect()
+	_blk_raw = PackedByteArray()
+	rd.buffer_get_data_async(_blk_buf_rgba, _on_block_overlay_data)
+
+
+func _on_block_overlay_data(data: PackedByteArray) -> void:
+	_blk_raw = data
+
+
+# sync() 之后：取出查询结果，更新阻挡格叠加纹理
+func _apply_select_readback() -> void:
+	sel_query = agents.take_select_inspect(selected_agent)
+	if _blk_raw.size() == grid_width * grid_height * 4:
+		_blk_tex.diffuse_texture = _overlay_texture(_blk_tex.diffuse_texture, _blk_raw)
+	_blk_raw = PackedByteArray()
 
 
 func _update_select_label() -> void:
 	if select_label == null:
 		return
-	if selected_agent < 0 or selected_agent >= agent_count:
+	if selected_agent < 0 or selected_agent >= agent_count or sel_query.get("sel", -1) != selected_agent:
 		select_label.text = ""
 		return
 	var idx := selected_agent
-	var alive := cached_info.size() > idx and (cached_info[idx] & 1) != 0
-	var fac := 0
-	var is_atk := false
-	var is_disp := false
-	if cached_info.size() > idx:
-		fac = (cached_info[idx] >> 1) & 0x1F
-		is_atk = (cached_info[idx] & (1 << 9)) != 0
-		is_disp = (cached_info[idx] & (1 << 10)) != 0
+	var info: int = sel_query.info
+	var alive := (info & 1) != 0
+	var fac := (info >> 1) & 0x1F
+	var is_atk := (info & (1 << 9)) != 0
 	var team := "G%d" % fac
-	var dmg := 0
-	if cached_damage.size() > idx:
-		dmg = cached_damage[idx]
+	var dmg: int = sel_query.dmg
 	var max_hp_val := cpu_max_hp[idx] if idx < cpu_max_hp.size() else 20000
 	var hp_cur := maxf(float(max_hp_val - dmg) / 100.0, 0.0)
 	var hp_max := float(max_hp_val) / 100.0
@@ -897,28 +987,14 @@ func _update_select_label() -> void:
 	var rng_val := cpu_atk_range[idx] if idx < cpu_atk_range.size() else 0.0
 	var dmg_val := cpu_atk_damage[idx] if idx < cpu_atk_damage.size() else 0.0
 	var status := "DEAD" if not alive else ("Attacking" if is_atk else "Idle")
-	var pos_v := agent_pos[idx] if idx < agent_pos.size() else Vector2.ZERO
+	var pos_v: Vector2 = sel_query.pos
 
-	# Find nearest enemy
-	nearest_enemy = -1
-	var my_ally_mask := alliance_masks[fac] if fac < alliance_masks.size() else 0
-	var ne_dsq := INF
-	for j in range(agent_count):
-		if j == idx:
-			continue
-		if cached_info.size() <= j or (cached_info[j] & 1) == 0:
-			continue
-		var jfac := (cached_info[j] >> 1) & 0x1F
-		if (my_ally_mask >> jfac) & 1:
-			continue
-		var dsq := agent_pos[idx].distance_squared_to(agent_pos[j])
-		if dsq < ne_dsq:
-			ne_dsq = dsq
-			nearest_enemy = j
+	# Nearest enemy（GPU 查询：alliance 之外的存活 agent 中距离²最小者，平局取最小下标）
+	nearest_enemy = sel_query.ne
 	var ne_str := ""
 	if nearest_enemy >= 0:
-		var ne_dist := sqrt(ne_dsq)
-		var ne_fac := (cached_info[nearest_enemy] >> 1) & 0x1F
+		var ne_dist := sqrt(float(sel_query.ne_dsq))
+		var ne_fac := (int(sel_query.ne_info) >> 1) & 0x1F
 		ne_str = "Nearest Enemy: #%d (Fac %d) dist=%.1f%s" % [
 			nearest_enemy, ne_fac, ne_dist,
 			"  IN RANGE" if ne_dist <= rng_val else ""]
@@ -991,10 +1067,6 @@ func _process(dt: float) -> void:
 	agents.dispatch_cell_blocked(cl)
 	rd.compute_list_add_barrier(cl)
 
-	# 5.6 — DISP flow field (escape direction for displaced agents)
-	agents.dispatch_disp_flow(cl, NUM_GOAL_GROUPS, NUM_FACTIONS)
-	rd.compute_list_add_barrier(cl)
-
 	# 6 — Agent steer + integrate
 	agents.dispatch_steer(cl, dt, separation_radius, separation_strength,
 						  steering_responsiveness, world_size.x, world_size.y)
@@ -1002,17 +1074,35 @@ func _process(dt: float) -> void:
 
 	# 7 — Build MultiMesh buffer on GPU
 	agents.dispatch_build_mm(cl, DISPLAY_LERP)
+	rd.compute_list_add_barrier(cl)
+
+	# 7.5 — 远程激光压缩（供批量绘制）
+	agents.dispatch_laser_compact(cl, RANGED_LASER_LIFE)
+
+	# 7.6 — 选中 agent：GPU 查询（读 steer 本帧写出的位置，上面的 barrier 已保证 steer 完成）+ 阻挡格叠加
+	var sel_active := selected_agent >= 0 and selected_agent < agent_count
+	if sel_active:
+		_record_select(cl, false)
+
+	# 7.7 — Dynamic goal update (GPU BFS, 1 group per frame round-robin)
+	# 只读本帧 density 写的 faction_presence；写出的 goal_dist_all/gdir 下一帧才被 velocity/combat 读
+	field.dispatch_goal_bfs(cl, _goal_rr_idx, NUM_FACTIONS)
+	_goal_rr_idx = (_goal_rr_idx + 1) % NUM_GOAL_GROUPS
 
 	rd.compute_list_end()
+	# 本帧 mm / 计数 / 激光的异步回读，数据随下面的 sync() 到达（t0→t1 含这部分拷贝）
+	agents.request_frame_readback(agent_count)
+	if sel_active:
+		_request_select_readback()
 	rd.submit()
 	rd.sync()
 	var t1 := Time.get_ticks_usec()
 
-	# 8 — Swap double-buffer; readback positions only when needed
+	# 8 — Swap double-buffer; 选中时取出随 sync 到达的查询结果 / 阻挡格叠加
 	agents.swap_buffers()
 	var t1b := Time.get_ticks_usec()
-	if selected_agent >= 0:
-		agent_pos = agents.readback_current_positions()
+	if sel_active:
+		_apply_select_readback()
 	var t1c := Time.get_ticks_usec()
 	_sync_multimesh_gpu()
 	_sync_laser_overlay()
@@ -1044,25 +1134,13 @@ func _process(dt: float) -> void:
 			else:
 				(_gi_sprite.texture as ImageTexture).update(gi_img)
 
-	# 9 — Dynamic goal update (GPU BFS, 1 group per frame round-robin)
-	var goal_ms := 0.0
-	var tg0 := Time.get_ticks_usec()
-	var gcl := rd.compute_list_begin()
-	field.dispatch_goal_bfs(gcl, _goal_rr_idx, NUM_FACTIONS)
-	rd.compute_list_end()
-	rd.submit()
-	rd.sync()
-	_goal_rr_idx = (_goal_rr_idx + 1) % NUM_GOAL_GROUPS
-	goal_ms = float(Time.get_ticks_usec() - tg0) / 1000.0
-	perf_goal = lerpf(perf_goal, goal_ms, perf_alpha)
-
 	var t3 := Time.get_ticks_usec()
 
 	# 10 — GPU overlay (density / velocity), filtered by selected agent's faction
 	var ov_group_off := 0
 	var ov_fac_mask := 0
-	if selected_agent >= 0 and selected_agent < cached_info.size():
-		var sel_info := cached_info[selected_agent]
+	if selected_agent >= 0 and sel_query.get("sel", -1) == selected_agent:
+		var sel_info: int = sel_query.info
 		var sel_fac := int((sel_info >> 1) & 0x1F)
 		var sel_grp := faction_to_group[sel_fac] if sel_fac < faction_to_group.size() else 0
 		ov_group_off = sel_grp * grid_width * grid_height
@@ -1086,14 +1164,14 @@ func _process(dt: float) -> void:
 	var frame_total := float(t3 - t0) / 1000.0
 	if frame_total > perf_peak_total:
 		perf_peak_total = frame_total
-		perf_peak_detail = "GPU=%.1f Rd=%.1f MM=%.1f G=%.1f" % [
-			gpu_ms, rd_ms, mm_ms, goal_ms]
+		perf_peak_detail = "GPU=%.1f Rd=%.1f MM=%.1f" % [
+			gpu_ms, rd_ms, mm_ms]
 	if frame_total > 50.0:
-		print("[SPIKE] %.1f ms | GPU=%.1f Rd=%.1f MM=%.1f Goal=%.1f" % [
-			frame_total, gpu_ms, rd_ms, mm_ms, goal_ms])
+		print("[SPIKE] %.1f ms | GPU=%.1f Rd=%.1f MM=%.1f" % [
+			frame_total, gpu_ms, rd_ms, mm_ms])
 	fps_label.text = "FPS: %d" % Engine.get_frames_per_second()
 	hud_label.text = (
-		"GPU %.1f  Rd %.1f  MM %.1f  Goal %.1f | Alive: %d / %d\n" % [perf_gpu, perf_read, perf_mesh, perf_goal, alive_count, agent_count]
+		"GPU %.1f  Rd %.1f  MM %.1f | Alive: %d / %d\n" % [perf_gpu, perf_read, perf_mesh, alive_count, agent_count]
 		+ "PEAK: %.1f ms  %s" % [perf_peak_total, perf_peak_detail]
 	)
 
@@ -1459,6 +1537,7 @@ func _apply_agent_count() -> void:
 	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
 	agents.clear_laser_events()
+	_laser_count = 0
 	agents.clear_hit_flash_events()
 	_sync_multimesh_cpu()
 	_sync_laser_overlay()
@@ -1485,6 +1564,7 @@ func _reset_sim() -> void:
 	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
 	agents.clear_laser_events()
+	_laser_count = 0
 	agents.clear_hit_flash_events()
 	_setup_goals()
 	field.upload_static_data()
@@ -1494,33 +1574,6 @@ func _reset_sim() -> void:
 
 # ── Drawing ──────────────────────────────────────────────────────────────
 
-func _draw_lasers(layer: Node2D) -> void:
-	if cached_laser_ttl.is_empty() or cached_laser_lines.is_empty():
-		return
-	var max_i := mini(agent_count, cached_laser_ttl.size())
-	max_i = mini(max_i, int(cached_laser_lines.size() / 4))
-	var life := maxf(RANGED_LASER_LIFE, 0.001)
-	for i in range(max_i):
-		var ttl := cached_laser_ttl[i]
-		if ttl <= 0.0:
-			continue
-		var off := i * 4
-		var p0 := Vector2(cached_laser_lines[off], cached_laser_lines[off + 1])
-		var p1 := Vector2(cached_laser_lines[off + 2], cached_laser_lines[off + 3])
-		if p0.distance_squared_to(p1) < 1.0:
-			continue
-		var fade := clampf(ttl / life, 0.0, 1.0)
-		var fac := 0
-		if i < agent_factions.size():
-			fac = agent_factions[i]
-		elif i < cpu_agent_info.size():
-			fac = (cpu_agent_info[i] >> 1) & 0x1F
-		var fac_col := faction_colors[fac] if fac < faction_colors.size() else Color.WHITE
-		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.055 * fade), RANGED_LASER_VIS_SOFT_WIDTH, true)
-		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.16 * fade), RANGED_LASER_VIS_GLOW_WIDTH, true)
-		layer.draw_line(p0, p1, Color(fac_col.r, fac_col.g, fac_col.b, 0.62 * fade), RANGED_LASER_VIS_WIDTH, true)
-
-
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, world_size), Color(0.11, 0.11, 0.14))
 	var cs_val := cell_size
@@ -1528,28 +1581,16 @@ func _draw() -> void:
 	for gc in goal_cells:
 		draw_rect(Rect2(gc.x * cs_val, gc.y * cs_val, cs_val, cs_val), Color(0.2, 0.75, 0.35, 0.18))
 
-	if selected_agent >= 0 and selected_agent < agent_pos.size():
-		var sel_pos := agent_pos[selected_agent]
-		var sel_alive := cached_info.size() > selected_agent and (cached_info[selected_agent] & 1) != 0
+	# 选中信息全部来自 GPU 查询（sel_query）
+	if selected_agent >= 0 and sel_query.get("sel", -1) == selected_agent:
+		var sel_pos: Vector2 = sel_query.pos
+		var sel_info: int = sel_query.info
+		var sel_alive := (sel_info & 1) != 0
 		var sel_col := Color(1.0, 1.0, 0.2, 0.8) if sel_alive else Color(1.0, 0.3, 0.3, 0.6)
 
-		var sel_info := cached_info[selected_agent] if selected_agent < cached_info.size() else 0
-		var sel_fac := (sel_info >> 1) & 0x1F
-		var sel_grp := faction_to_group[sel_fac] if sel_fac < faction_to_group.size() else 0
-		var grp_bit := 1 << sel_grp
-
-		if cached_cell_blocked.size() > 0:
-			var total_cells := grid_width * grid_height
-			for ci in range(mini(total_cells, cached_cell_blocked.size())):
-				var cb := cached_cell_blocked[ci]
-				if cb == -1:
-					continue
-				if (cb & grp_bit) == 0:
-					continue
-				var cx := ci % grid_width
-				var cy := ci / grid_width
-				draw_rect(Rect2(cx * cs_val, cy * cs_val, cs_val, cs_val),
-						  Color(1.0, 0.2, 0.2, 0.35))
+		# 选中 agent 所在 group 的阻挡格：GPU 叠加纹理一次画出（每格一个纹素）
+		if _blk_tex.diffuse_texture != null:
+			draw_texture_rect(_blk_tex, Rect2(Vector2.ZERO, world_size), false)
 
 		draw_arc(sel_pos, agent_radius * 2.5, 0, TAU, 32, sel_col, 2.0)
 		draw_arc(sel_pos, agent_radius * 3.5, 0, TAU, 32, Color(sel_col.r, sel_col.g, sel_col.b, 0.3), 1.0)
@@ -1557,21 +1598,21 @@ func _draw() -> void:
 			var rng := cpu_atk_range[selected_agent]
 			if rng > 0.0:
 				draw_arc(sel_pos, rng, 0, TAU, 64, Color(1.0, 0.4, 0.2, 0.5), 1.5)
-		if nearest_enemy >= 0 and nearest_enemy < agent_pos.size():
-			var ne_pos := agent_pos[nearest_enemy]
+		if int(sel_query.ne) >= 0:
+			var ne_pos: Vector2 = sel_query.ne_pos
 			draw_line(sel_pos, ne_pos, Color(1.0, 0.2, 0.2, 0.7), 1.5)
 			draw_arc(ne_pos, agent_radius * 2.0, 0, TAU, 24, Color(1.0, 0.2, 0.2, 0.8), 2.0)
 
 		var sel_is_disp := (sel_info & (1 << 10)) != 0
-		if sel_is_disp and cached_cell_atk.size() > 0:
-			var sel_cx := clampi(int(agent_pos[selected_agent].x / cell_size), 0, grid_width - 1)
-			var sel_cy := clampi(int(agent_pos[selected_agent].y / cell_size), 0, grid_height - 1)
-			var ci := sel_cy * grid_width + sel_cx
-			var blocker := cached_cell_atk[ci] if ci < cached_cell_atk.size() else -1
+		if sel_is_disp:
+			var ci: int = sel_query.cell
+			var sel_cx := ci % grid_width
+			var sel_cy := ci / grid_width
+			var blocker: int = sel_query.blocker
 			draw_rect(Rect2(sel_cx * cs_val, sel_cy * cs_val, cs_val, cs_val),
 					  Color(1.0, 0.5, 0.0, 0.5))
-			if blocker >= 0 and blocker != selected_agent and blocker < agent_pos.size():
-				var bpos := agent_pos[blocker]
+			if blocker >= 0 and blocker != selected_agent and blocker < agent_count:
+				var bpos: Vector2 = sel_query.blk_pos
 				draw_line(sel_pos, bpos, Color(1.0, 0.6, 0.0, 0.8), 2.0)
 				draw_arc(bpos, agent_radius * 2.0, 0, TAU, 24, Color(1.0, 0.6, 0.0, 0.9), 2.0)
 
@@ -1627,6 +1668,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				elif event.button_index == MOUSE_BUTTON_RIGHT:
 					selected_agent = -1
 					nearest_enemy = -1
+					_refresh_selection()
 					_update_select_label()
 					queue_redraw()
 				elif event.button_index == MOUSE_BUTTON_WHEEL_UP:

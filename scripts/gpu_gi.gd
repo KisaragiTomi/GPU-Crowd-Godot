@@ -93,6 +93,8 @@ var _last_region_size := Vector2.ZERO
 var debug_stage: int = 4
 
 var _frame_uniform_sets: Array[RID] = []
+var _out_tex: RID  # _finish_compute 里登记异步回读的纹理
+var _out_raw := PackedByteArray()  # 该纹理随 sync() 到达的数据
 
 
 func _init(rendering_device: RenderingDevice, width: int, height: int,
@@ -222,7 +224,10 @@ func compute_gi(agent_count: int, region_origin: Vector2, region_size: Vector2,
 
 func get_output_image() -> Image:
 	var source := tex_display if tex_display.is_valid() else tex_output
-	var raw := rd.texture_get_data(source, 0)
+	var raw := _out_raw
+	_out_raw = PackedByteArray()
+	# 优先用 _finish_compute 登记、随 sync() 到达的数据；缺失（或不是这张纹理的）时退回同步回读
+	if _out_tex != source or raw.size() != tex_w * tex_h * 16: raw = rd.texture_get_data(source, 0)
 	return Image.create_from_data(tex_w, tex_h, false, Image.FORMAT_RGBAF, raw)
 
 
@@ -413,6 +418,10 @@ func _dispatch_resample(cl: int, source_tex: RID) -> void:
 
 func _finish_compute(cl: int) -> void:
 	rd.compute_list_end()
+	# 登记本次要显示的纹理的异步回读，数据随 sync() 到达
+	_out_tex = _next_display_tex()
+	_out_raw = PackedByteArray()
+	rd.texture_get_data_async(_out_tex, 0, _on_output_data)
 	rd.submit()
 	rd.sync()
 
@@ -420,6 +429,17 @@ func _finish_compute(cl: int) -> void:
 		if us.is_valid():
 			rd.free_rid(us)
 	_frame_uniform_sets.clear()
+
+
+# 本次 compute_gi 结束后要显示的纹理：stage 4 的结果写在 tex_stable，_finish_compute 之后才由
+# _swap_temporal_output 换成 tex_history / tex_display；其余 stage 在 _finish_compute 之前已设好 tex_display
+func _next_display_tex() -> RID:
+	if debug_stage == 4: return tex_stable
+	return tex_display if tex_display.is_valid() else tex_output
+
+
+func _on_output_data(data: PackedByteArray) -> void:
+	_out_raw = data
 
 
 func _swap_jfa() -> void:

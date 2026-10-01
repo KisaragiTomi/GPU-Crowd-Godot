@@ -43,6 +43,7 @@ var buf_gdir_y: RID
 var buf_out_vx: RID
 var buf_out_vy: RID
 var buf_bfs_dist: RID
+var buf_bfs_flags: RID  # BFS 全局变化标志（3 槽轮换），用于 early-out
 var uset_bfs: RID
 
 var shader_flux: RID
@@ -257,6 +258,8 @@ func _init_gpu() -> void:
 	zb_uint.resize(cell_count * 4)
 	zb_uint.fill(0xFF)
 	buf_bfs_dist = rd.storage_buffer_create(cell_count * 4, zb_uint)
+	var z16 := PackedByteArray(); z16.resize(16)
+	buf_bfs_flags = rd.storage_buffer_create(16, z16)
 
 	# Sparse tile dispatch (decoupled module)
 	sparse = SparseTileDispatch.new(rd, gw, gh, 8, 1, 0.001)
@@ -300,14 +303,16 @@ func setup_bfs(faction_presence: RID, fac_to_group: RID) -> void:
 		_ubuf(5, buf_goal_dist),
 		_ubuf(6, buf_gdir_x),
 		_ubuf(7, buf_gdir_y),
+		_ubuf(8, buf_bfs_flags),
 	], shader_bfs, 0)
 
 
-const BFS_RELAX_ITERS := 256
+const BFS_TILE := 16            # 与 goal_bfs.glsl 的 local_size 一致
+const BFS_RELAX_PASSES := 80    # 全局分块松弛次数：每次波前至少推进一个 tile（16 格），80 次覆盖全图对角；收敛后其余 pass 整组 early-out
 
 func dispatch_goal_bfs(cl: int, target_group: int, num_factions: int) -> void:
-	var gx := ceili(float(gw) / 8.0)
-	var gy := ceili(float(gh) / 8.0)
+	var gx := ceili(float(gw) / BFS_TILE)
+	var gy := ceili(float(gh) / BFS_TILE)
 	var p := PackedByteArray(); p.resize(32)
 	p.encode_s32(0, gw)
 	p.encode_s32(4, gh)
@@ -322,22 +327,18 @@ func dispatch_goal_bfs(cl: int, target_group: int, num_factions: int) -> void:
 	rd.compute_list_dispatch(cl, gx, gy, 1)
 	rd.compute_list_add_barrier(cl)
 
-	# RELAX iterations
+	# RELAX（分块松弛）：add_barrier 会自动重绑 pipeline / uniform set / push constant；relax_pass 用于轮换标志槽
 	p.encode_s32(8, 1)
-	for _i in range(BFS_RELAX_ITERS):
-		rd.compute_list_bind_compute_pipeline(cl, pipeline_bfs)
-		rd.compute_list_bind_uniform_set(cl, uset_bfs, 0)
+	for i in range(BFS_RELAX_PASSES):
+		p.encode_s32(20, i)
 		rd.compute_list_set_push_constant(cl, p, 32)
 		rd.compute_list_dispatch(cl, gx, gy, 1)
 		rd.compute_list_add_barrier(cl)
 
 	# GRADIENT
 	p.encode_s32(8, 2)
-	rd.compute_list_bind_compute_pipeline(cl, pipeline_bfs)
-	rd.compute_list_bind_uniform_set(cl, uset_bfs, 0)
 	rd.compute_list_set_push_constant(cl, p, 32)
 	rd.compute_list_dispatch(cl, gx, gy, 1)
-	rd.compute_list_add_barrier(cl)
 
 
 func upload_static_data() -> void:
@@ -457,7 +458,7 @@ func cleanup() -> void:
 				buf_density, buf_goal_dist, buf_goal_dist_all, buf_terrain,
 				buf_fr, buf_fl, buf_fd, buf_fu,
 				buf_gdir_x, buf_gdir_y, buf_out_vx, buf_out_vy,
-				buf_bfs_dist]:
+				buf_bfs_dist, buf_bfs_flags]:
 		if rid.is_valid():
 			rd.free_rid(rid)
 	rd = null
