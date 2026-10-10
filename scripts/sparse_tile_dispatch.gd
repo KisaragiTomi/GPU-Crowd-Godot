@@ -180,8 +180,9 @@ func _ubuf(binding: int, buf: RID) -> RDUniform:
 func cleanup() -> void:
 	if rd == null:
 		return
-	for rid in [_uset_compact, _uset_finalize,
-				_pipeline_compact, _pipeline_finalize,
+	for us in [_uset_compact, _uset_finalize]:
+		if us.is_valid() and rd.uniform_set_is_valid(us): rd.free_rid(us)
+	for rid in [_pipeline_compact, _pipeline_finalize,
 				_shader_compact, _shader_finalize,
 				buf_compact_counter, buf_compact_tile_coords, buf_indirect_args]:
 		if rid.is_valid():

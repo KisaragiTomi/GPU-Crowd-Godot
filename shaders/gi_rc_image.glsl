@@ -23,30 +23,36 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0, std430) buffer ConstBuffer {
-    uint add_data;
-} consts;
+layout(set=0,binding=1,rgba16f)writeonly uniform image2D output_image;
+// 所有 cascade 按线性像素下标紧凑存放在一张纹理里：pixel_index -> (idx % CASCADE_TEX_W, idx / CASCADE_TEX_W)
+const int CASCADE_TEX_W_SHIFT = 11;
+const int CASCADE_TEX_W = 1 << CASCADE_TEX_W_SHIFT;  // 须与 GPUGI.CASCADE_TEX_W 一致
+layout(set = 0, binding = 10, rgba16f) readonly uniform image2D cascades_image;
 
 
-layout(set=0,binding=1,rgba32f)writeonly uniform image2D output_image;
-layout(set=0,binding=2,rgba32f)readonly uniform image2D input_image;
-// layout(set = 0, binding = 1, rgba32f) readonly uniform image2D emissivity_image;
-// layout(set = 0, binding = 3, rgba32f) writeonly uniform image2D output_image;
-layout(set = 0, binding = 10, rgba32f) readonly uniform image2D cascades_image_0;
-layout(set = 0, binding = 11, rgba32f) readonly uniform image2D cascades_image_1;
-layout(set = 0, binding = 12, rgba32f) readonly uniform image2D cascades_image_2;
-layout(set = 0, binding = 13, rgba32f) readonly uniform image2D cascades_image_3;
-layout(set = 0, binding = 14, rgba32f) readonly uniform image2D cascades_image_4;
-layout(set = 0, binding = 15, rgba32f) readonly uniform image2D cascades_image_5;
-
-
-layout(set = 0, binding = 3, std430) restrict readonly buffer ParamsBuffer {
-    // int cascade_index; // Current cascade level
-    // int prev_cascade_index; // Previous cascade level
-    int num_cascades; // Total number of cascades
-    int cascade_size_x; // Size of each cascade
-    int cascade_size_y; // Size of each cascade
+layout(set = 0, binding = 0, std430) restrict readonly buffer GIParamsBuffer {
+    int   agent_count;
+    float tex_w;
+    float tex_h;
+    float region_x;
+    float region_y;
+    float region_w;
+    float region_h;
+    float splat_radius;
+    float emit_strength;
+    int   terrain_w;
+    int   terrain_h;
+    float terrain_cell_size;
+    float wall_alpha;
+    float laser_width;
+    float laser_emit_strength;
+    float laser_life;
+    int   laser_count;
+    int   laser_cap;
     float interval_scale;
+    float history_weight;
+    float spatial_strength;
+    int   num_cascades; // Total number of cascades
 };
 
 //================================================================================================================
@@ -104,38 +110,11 @@ float GetC0IntervalLength(ivec2 viewport_size)
 
 // vec2 screenRes;
 
-// vec4 cubemapFetch(samplerCube sampler, int face, ivec2 P) {
-vec4 cubemapFetch(int face, ivec2 P) {
-    // Look up a single texel in a cubemap
-    // ivec2 cubemapRes = textureSize(sampler, 0);
-    ivec2 cubemapRes = imageSize(cascades_image_0).xy;
-    if (clamp(P, ivec2(0), cubemapRes - 1) != P || face < 0 || face > 5) {
-        return vec4(0.0);
-    }
-
-    // vec2 p = (vec2(P) + 0.5) / vec2(cubemapRes) * 2.0 - 1.0;
-    // vec3 c;
-    
-    // switch (face) {
-    //     case 0: c = vec3( 1.0, -p.y, -p.x); break;
-    //     case 1: c = vec3(-1.0, -p.y,  p.x); break;
-    //     case 2: c = vec3( p.x,  1.0,  p.y); break;
-    //     case 3: c = vec3( p.x, -1.0, -p.y); break;
-    //     case 4: c = vec3( p.x, -p.y,  1.0); break;
-    //     case 5: c = vec3(-p.x, -p.y, -1.0); break;
-    // }
-    
-    // return texture(sampler, normalize(c));
-    vec4 data = ivec4(0);
-    switch (face) {
-        case 0: data = imageLoad(cascades_image_0, P); break;
-        case 1: data = imageLoad(cascades_image_1, P); break;
-        case 2: data = imageLoad(cascades_image_2, P); break;
-        case 3: data = imageLoad(cascades_image_3, P); break;
-        case 4: data = imageLoad(cascades_image_4, P); break;
-        case 5: data = imageLoad(cascades_image_5, P); break;
-    }
-    return data;
+vec4 cascadeFetch(int pixel_index) {
+    // Look up a single texel of the packed cascade storage
+    ivec2 P = ivec2(pixel_index & (CASCADE_TEX_W - 1), pixel_index >> CASCADE_TEX_W_SHIFT);
+    if (pixel_index < 0 || P.y >= imageSize(cascades_image).y) return vec4(0.0);
+    return imageLoad(cascades_image, P);
 }
 
 ivec2 roundSDim(ivec2 v) {
@@ -261,14 +240,6 @@ ProbeLocation PixelIndexToProbeLocation(int pixel_index, CascadeSize c0_size)
     probe_location.probe_index = ivec2(probe_linear_index % cascade_size.probes_count.x, probe_linear_index / cascade_size.probes_count.x);
     return probe_location;
 }
-ivec3 PixelIndexToCubemapTexel(ivec2 face_size, int pixel_index)
-{
-    int face_pixels_count = face_size.x * face_size.y;
-    int face_index = pixel_index / face_pixels_count;
-    int face_pixel_index = pixel_index - face_pixels_count * face_index;
-    ivec2 face_pixel = ivec2(face_pixel_index % face_size.x, face_pixel_index / face_size.x);
-    return ivec3(face_pixel, face_index);
-}
 
 vec2 GetProbeScreenSize(int cascade_index, CascadeSize c0_size)
 {
@@ -384,11 +355,10 @@ void main() {
     // fragCoord is the pixel coordinate, this is same for shadertoy and for compute shaders
     vec2 fragCoord = gl_GlobalInvocationID.xy;
     ivec2 ifragCoord = ivec2(fragCoord.xy);
+    if (ifragCoord.x >= imageSize(output_image).x || ifragCoord.y >= imageSize(output_image).y) return;
     vec4 fragColor = vec4(0.0);
-    ivec2 _cascade_size = ivec2(cascade_size_x, cascade_size_y); // validated this to return the correct size 1024x1024
 
     ivec2 viewport_size = imageSize(output_image).xy; // validated this to return the correct size 1280x720
-    ivec2 face_size = imageSize(cascades_image_0).xy; // validated this to return the correct size 1024x1024
 
     vec2 screen_pos = fragCoord.xy / vec2(viewport_size); // normalized screen position (0-1 for x and y)
     CascadeSize c0_size = GetC0Size(viewport_size);
@@ -410,8 +380,7 @@ void main() {
             probe_location.dir_index = dir_index;
             
             int pixel_index = ProbeLocationToPixelIndex(probe_location, c0_size);
-            ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
-            vec4 src_radiance = cubemapFetch(texel_index.z, texel_index.xy);
+            vec4 src_radiance = cascadeFetch(pixel_index);
             fluence += src_radiance * weights[i] / float(cascade_size.dirs_count);
         }
     }
@@ -423,11 +392,6 @@ void main() {
     //fragColor = vec4(pow(fluence / (fluence + 1.0), vec3(1.0/2.5)), 1.0);
     fragColor = vec4(1.0 - 1.0 / pow(1.0 + fluence.rgb, vec3(2.5)), 1.0);
 
-
-    // if (ifragCoord.x < _cascade_size.x && ifragCoord.y < _cascade_size.y) {
-    //     fragColor = imageLoad(cascades_image_1,ifragCoord);
-    //     fragColor.a = 1.0;
-    // }
 
     imageStore(output_image, ifragCoord, fragColor);
 }

@@ -323,17 +323,14 @@ func _u(binding: int, buf: RID) -> RDUniform:
 
 # ── Agent upload / readback ─────────────────────────────────────────────
 
-func upload_agents(positions: PackedVector2Array, velocities: PackedVector2Array, count: int) -> void:
+## 出生位置（SoA，长度 max_agents，count 之后为 0）→ 当前位置缓冲和显示位置；速度清零
+func upload_agents(px: PackedFloat32Array, py: PackedFloat32Array, count: int) -> void:
 	agent_count = count
-	var px := PackedFloat32Array(); px.resize(max_agents)
-	var py := PackedFloat32Array(); py.resize(max_agents)
-	var vx := PackedFloat32Array(); vx.resize(max_agents)
-	var vy := PackedFloat32Array(); vy.resize(max_agents)
-	for i in range(count):
-		px[i] = positions[i].x;  py[i] = positions[i].y
-		vx[i] = velocities[i].x; vy[i] = velocities[i].y
 	_upf(buf_pos_x[cur], px); _upf(buf_pos_y[cur], py)
-	_upf(buf_vel_x[cur], vx); _upf(buf_vel_y[cur], vy)
+	var zf := _zero_bytes(max_agents)
+	rd.buffer_update(buf_vel_x[cur], 0, zf.size(), zf)
+	rd.buffer_update(buf_vel_y[cur], 0, zf.size(), zf)
+	_upf(buf_mm_disp_x, px); _upf(buf_mm_disp_y, py)
 
 
 func upload_combat_data(info: PackedInt32Array, max_hp_arr: PackedInt32Array,
@@ -496,14 +493,16 @@ func dispatch_cell_blocked(cl: int) -> void:
 	rd.compute_list_dispatch(cl, ceili(float(_field_gw) / 8.0), ceili(float(_field_gh) / 8.0), 1)
 
 
-func dispatch_build_mm(cl: int, lerp_t: float) -> void:
+## from_current=false：主 compute list 里 steer 之后，读 steer 本帧输出 pos[1-cur]；
+## from_current=true：单独派发，读当前位置 pos[cur]（重置 / 改数量后刚上传的出生位置）
+func dispatch_build_mm(cl: int, lerp_t: float, from_current: bool = false) -> void:
 	var p := PackedByteArray(); p.resize(16)
 	p.encode_s32(0, agent_count)
 	p.encode_float(4, lerp_t)
 	p.encode_s32(8, 0)
 	p.encode_s32(12, 0)
 	rd.compute_list_bind_compute_pipeline(cl, pip_build_mm)
-	rd.compute_list_bind_uniform_set(cl, us_build_mm[cur], 0)
+	rd.compute_list_bind_uniform_set(cl, us_build_mm[1 - cur if from_current else cur], 0)
 	rd.compute_list_set_push_constant(cl, p, 16)
 	rd.compute_list_dispatch(cl, _live_groups(), 1, 1)
 
@@ -526,16 +525,6 @@ func upload_faction_colors(colors: Array[Color]) -> void:
 		data[i * 4 + 2] = colors[i].b
 		data[i * 4 + 3] = 1.0
 	_upf(buf_mm_fac_colors, data)
-
-
-func upload_display_pos(positions: PackedVector2Array, count: int) -> void:
-	var dx := PackedFloat32Array(); dx.resize(max_agents)
-	var dy := PackedFloat32Array(); dy.resize(max_agents)
-	for i in range(count):
-		dx[i] = positions[i].x
-		dy[i] = positions[i].y
-	_upf(buf_mm_disp_x, dx)
-	_upf(buf_mm_disp_y, dy)
 
 
 func dispatch_steer(cl: int, dt: float, sep_r: float, sep_str: float,
@@ -758,14 +747,19 @@ func cleanup() -> void:
 	var _free := func(rid: RID) -> void:
 		if rid.is_valid():
 			rd.free_rid(rid)
+	# uniform set 引用 field 的缓冲，可能已被 Godot 连带释放，先确认仍有效
+	var _free_set := func(rid: RID) -> void:
+		if rid.is_valid() and rd.uniform_set_is_valid(rid): rd.free_rid(rid)
 	# 选中查询：uniform set 依赖 pos/info 等缓冲，要在它们释放前先释放
-	for rid in us_sel_inspect + [pip_sel_inspect, shd_sel_inspect, buf_sel_q]:
+	for rid in us_sel_inspect:
+		_free_set.call(rid)
+	for rid in [pip_sel_inspect, shd_sel_inspect, buf_sel_q]:
 		_free.call(rid)
-	for rid in [us_clear, us_prefix, us_steer_s1, us_cell_blocked]:
-		_free.call(rid)
+	for rid in [us_clear, us_prefix, us_steer_s1, us_cell_blocked, us_laser_compact]:
+		_free_set.call(rid)
 	for arr in [us_count, us_scatter, us_density, us_steer, us_combat, us_build_mm]:
 		for rid in arr:
-			_free.call(rid)
+			_free_set.call(rid)
 	for pip in [pip_clear, pip_count, pip_prefix, pip_scatter,
 				pip_density, pip_steer, pip_combat, pip_cell_blocked,
 				pip_build_mm]:
@@ -774,8 +768,7 @@ func cleanup() -> void:
 				shd_density, shd_steer, shd_combat, shd_cell_blocked,
 				shd_build_mm]:
 		_free.call(shd)
-	# uniform set 须先于其引用的 buffer 释放
-	for rid in [us_laser_compact, pip_laser_compact, shd_laser_compact, buf_laser_compact]:
+	for rid in [pip_laser_compact, shd_laser_compact, buf_laser_compact]:
 		_free.call(rid)
 	for arr in [buf_pos_x, buf_pos_y, buf_vel_x, buf_vel_y]:
 		for rid in arr:

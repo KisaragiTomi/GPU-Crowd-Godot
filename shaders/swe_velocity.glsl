@@ -14,6 +14,7 @@ layout(set = 0, binding = 7, std430) restrict readonly  buffer B7 { float gdir_y
 layout(set = 0, binding = 8, std430) restrict writeonly buffer B8 { float out_vx[];  };
 layout(set = 0, binding = 9, std430) restrict writeonly buffer B9 { float out_vy[];  };
 layout(set = 0, binding = 10, std430) restrict readonly buffer B10 { uint compact_tile_coords[]; };
+layout(set = 0, binding = 11, std430) restrict readonly buffer B11 { float ground_cost[]; };
 
 layout(push_constant, std430) uniform Params {
 	int   gw;
@@ -67,8 +68,9 @@ void main() {
 			if (terrain[i] > 0.5) {
 				out_vx[gbase + i] = 0.0; out_vy[gbase + i] = 0.0;
 			} else {
-				out_vx[gbase + i] = gdir_x[gbase + i] * agent_speed;
-				out_vy[gbase + i] = gdir_y[gbase + i] * agent_speed;
+				float speed = agent_speed / clamp(round(ground_cost[i]), 1.0, 4.0);
+				out_vx[gbase + i] = gdir_x[gbase + i] * speed;
+				out_vy[gbase + i] = gdir_y[gbase + i] * speed;
 			}
 		}
 		return;
@@ -102,7 +104,8 @@ void main() {
 		dir_y /= dlen;
 	}
 
-	float local_speed = agent_speed / (1.0 + density[i] * density_slowdown);
+	float local_speed = agent_speed / (1.0 + density[i] * density_slowdown)
+		/ clamp(round(ground_cost[i]), 1.0, 4.0);
 	out_vx[gbase + i] = dir_x * local_speed;
 	out_vy[gbase + i] = dir_y * local_speed;
 }

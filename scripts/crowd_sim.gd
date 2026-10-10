@@ -77,8 +77,17 @@ const RENDER_LAYER_WORLD_AND_MINIMAP := RENDER_LAYER_WORLD | RENDER_LAYER_MINIMA
 @export var steering_responsiveness := 6.0
 @export var engage_range := 200.0
 @export var attack_cd_base := 1.0
+@export var ground_noise_seed := 0  # 0 = a new ground layout on each start/reset
+@export_range(0.005, 0.08, 0.001) var ground_noise_frequency := 0.022
 
 enum Equip { SWORD, SPEAR, BOW, CROSSBOW, SHIELD }
+
+# 装备位掩码（agent_equips）
+const EQ_SWORD := 1 << Equip.SWORD
+const EQ_SPEAR := 1 << Equip.SPEAR
+const EQ_BOW := 1 << Equip.BOW
+const EQ_CROSSBOW := 1 << Equip.CROSSBOW
+const EQ_SHIELD := 1 << Equip.SHIELD
 
 const EQUIP_DB := {
 	Equip.SWORD:    { "melee": true,  "range": 20.0,  "damage": 15.0, "cooldown": 0.8 },
@@ -92,15 +101,17 @@ var rd: RenderingDevice
 var field: GPUSWEField
 var agents: GPUAgents
 
-var agent_pos: PackedVector2Array
-var agent_vel: PackedVector2Array
-var display_pos: PackedVector2Array
+var agent_pos: PackedVector2Array  # _pick_agent 回读的当前位置
+var spawn_x: PackedFloat32Array    # _spawn_agents 生成的出生位置（SoA，长度 MAX_AGENTS），供 agents.upload_agents
+var spawn_y: PackedFloat32Array
 const DISPLAY_LERP := 0.4
 
 var world_size: Vector2
 var goal_cells: PackedVector2Array
 var _wall_sprite: Sprite2D
 var _wall_tex_dirty := true
+var _ground_sprite: Sprite2D
+var _ground_tex_dirty := true
 
 # GPU overlay system
 var _ov_shd: RID
@@ -124,12 +135,15 @@ var show_velocity := false
 var paused := false
 
 # Brush painting
-enum BrushMode { NONE, WALL, ERASE }
+enum BrushMode { NONE, WALL, ERASE, GROUND }
 var brush_mode: BrushMode = BrushMode.NONE
 var brush_radius := 2
 var is_painting := false
 var paint_erase := false
 var terrain_dirty := false
+var ground_dirty := false
+var brush_ground_cost := 2.0
+var _brush_label: Label
 
 var perf_gpu := 0.0
 var perf_read := 0.0
@@ -155,13 +169,17 @@ var mm_instance: MultiMeshInstance2D
 var mm_buf := PackedFloat32Array()
 
 # Per-agent CPU data
-var agent_equips: Array
+var agent_equips: PackedByteArray  # 装备位掩码（EQ_*）
 var agent_factions: PackedInt32Array
 var cpu_agent_info: PackedInt32Array
 var cpu_max_hp: PackedInt32Array
 var cpu_regen_rate: PackedFloat32Array
 var cpu_atk_range: PackedFloat32Array
 var cpu_atk_damage: PackedFloat32Array
+# 装备位掩码 → info 位 / 射程 / 伤害（_build_equip_tables）
+var _equip_info: PackedInt32Array
+var _equip_range: PackedFloat32Array
+var _equip_damage: PackedFloat32Array
 
 # Faction config
 var alliance_masks: PackedInt32Array
@@ -170,7 +188,6 @@ var faction_colors: Array[Color]
 var group_goals: Array
 var _goal_rr_idx := 0
 var cached_info := PackedInt32Array()
-var cached_damage := PackedInt32Array()
 
 var _agent_debounce_timer: Timer
 var _agent_pending_count := -1
@@ -243,12 +260,12 @@ func _ready() -> void:
 	)
 	agents.build_uniform_sets()
 	field.setup_bfs(agents.buf_faction_presence, agents.buf_fac_to_group)
+	_setup_goals()  # GPU BFS：需要 setup_bfs 之后、地形已上传
 
 	_spawn_agents()
-	agents.upload_agents(agent_pos, agent_vel, agent_count)
+	agents.upload_agents(spawn_x, spawn_y, agent_count)
 	_upload_combat()
 	agents.upload_faction_colors(faction_colors)
-	agents.upload_display_pos(agent_pos, agent_count)
 
 	_setup_multimesh()
 	_setup_overlay()
@@ -259,9 +276,14 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
-	if gi:
-		gi.cleanup()
+	# 本地 RenderingDevice 要手动释放：先放各模块的 RID（GI、叠加层的 uniform set 引用 agents / field 的缓冲，先放），最后 free 设备本身
+	if gi: gi.cleanup()
 	_cleanup_overlay()
+	if agents: agents.cleanup()
+	if field: field.cleanup()
+	if rd:
+		rd.free()
+		rd = null
 
 
 func _setup_gi() -> void:
@@ -305,7 +327,7 @@ func _update_gi_buffers() -> void:
 		agents.buf_mm_fac_colors,
 		agents.buf_hit_flash
 	)
-	gi.set_laser_buffers(agents.buf_laser_lines, agents.buf_laser_ttl)
+	gi.set_laser_buffer(agents.buf_laser_compact, GPUAgents.LASER_CAP)
 	if field:
 		gi.set_terrain_buffer(field.buf_terrain, grid_width, grid_height, cell_size)
 
@@ -420,6 +442,21 @@ func _build_environment() -> void:
 	field.add_wall(grid_width - 1, 0, grid_width, grid_height)
 
 	_gen_castles()
+	_generate_ground()
+
+	_ground_sprite = Sprite2D.new()
+	_ground_sprite.centered = false
+	_ground_sprite.z_index = 0  # above the parent's background, below the later wall sprite
+	_ground_sprite.visibility_layer = RENDER_LAYER_WORLD_AND_MINIMAP
+	_ground_sprite.scale = Vector2(cell_size, cell_size)
+	_ground_sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	var ground_shader := Shader.new()
+	ground_shader.code = GROUND_SHADER_CODE
+	var ground_mat := ShaderMaterial.new()
+	ground_mat.shader = ground_shader
+	_ground_sprite.material = ground_mat
+	add_child(_ground_sprite)
+	_ground_tex_dirty = true
 
 	_wall_sprite = Sprite2D.new()
 	_wall_sprite.centered = false
@@ -427,9 +464,61 @@ func _build_environment() -> void:
 	_wall_sprite.visibility_layer = RENDER_LAYER_WORLD_AND_MINIMAP
 	_wall_sprite.scale = Vector2(cell_size, cell_size)
 	_wall_sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	var wall_shader := Shader.new()
+	wall_shader.code = WALL_SHADER_CODE
+	var wall_mat := ShaderMaterial.new()
+	wall_mat.shader = wall_shader
+	_wall_sprite.material = wall_mat
 	add_child(_wall_sprite)
 	_wall_tex_dirty = true
-	_setup_goals()
+
+
+# 墙纹理是 terrain 本身（RF，每格一个纹素）：> 0.5 画墙色，其余透明
+const WALL_SHADER_CODE := """
+shader_type canvas_item;
+
+void fragment() {
+	COLOR = texture(TEXTURE, UV).r > 0.5 ? vec4(0.35, 0.35, 0.42, 1.0) : vec4(0.0);
+}
+"""
+
+
+const GROUND_SHADER_CODE := """
+shader_type canvas_item;
+
+void fragment() {
+	float cost = texture(TEXTURE, UV).r;
+	float t = clamp((cost - 2.0) / 2.0, 0.0, 1.0);
+	vec3 ground_color = mix(vec3(0.62, 0.44, 0.19), vec3(0.28, 0.18, 0.12), t);
+	COLOR = vec4(ground_color, cost > 1.0 ? 0.8 : 0.0);
+}
+"""
+
+
+func _generate_ground() -> void:
+	var noise := FastNoiseLite.new()
+	noise.seed = ground_noise_seed if ground_noise_seed != 0 else randi_range(1, 2147483647)
+	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	noise.frequency = ground_noise_frequency
+	noise.fractal_type = FastNoiseLite.FRACTAL_FBM
+	noise.fractal_octaves = 3
+	noise.fractal_gain = 0.5
+	field.ground_cost.fill(1.0)
+	# Broad normal areas, rough edges, then increasingly rare mud/deep-mud cores.
+	# Sampling coherent noise keeps adjacent cells in natural patches.
+	for y in range(1, grid_height - 1):
+		for x in range(1, grid_width - 1):
+			var i := field.idx(x, y)
+			if field.terrain[i] > 0.5:
+				continue
+			var value := noise.get_noise_2d(x, y)
+			if value > 0.50:
+				field.ground_cost[i] = 4.0
+			elif value > 0.26:
+				field.ground_cost[i] = 3.0
+			elif value > 0.04:
+				field.ground_cost[i] = 2.0
+	_ground_tex_dirty = true
 
 
 func _gen_castles() -> void:
@@ -447,6 +536,19 @@ func _gen_castles() -> void:
 		castle_base.load(castle_image_path)
 	castle_base.convert(Image.FORMAT_L8)
 	castle_base.resize(FOOT, FOOT, Image.INTERPOLATE_NEAREST)
+
+	# 墙掩码（LA8，alpha = 255 为墙）：亮度 > 0.5 即 L8 >= 128。阈值逐像素，与旋转/翻转可交换，只算一次
+	var lum := castle_base.get_data()
+	var mask_data := PackedByteArray(); mask_data.resize(FOOT * FOOT * 2)
+	if lum.size() >= FOOT * FOOT:
+		for k in range(FOOT * FOOT):
+			if lum[k] >= 128:
+				mask_data[k * 2 + 1] = 255
+	var mask_base := Image.create_from_data(FOOT, FOOT, false, Image.FORMAT_LA8, mask_data)
+	# 地形整张作为 RF 图，每座城堡按掩码写入 1.0（墙）
+	var wall_src := Image.create(FOOT, FOOT, false, Image.FORMAT_RF)
+	wall_src.fill(Color(1.0, 0.0, 0.0))
+	var terrain_img := Image.create_from_data(grid_width, grid_height, false, Image.FORMAT_RF, field.terrain.to_byte_array())
 
 	var mcx := grid_width / 2
 	var mcy := grid_height / 2
@@ -467,7 +569,7 @@ func _gen_castles() -> void:
 			continue
 		occupied.append(Rect2i(rx, ry, FOOT, FOOT))
 
-		var castle_img := castle_base.duplicate()
+		var castle_img: Image = mask_base.duplicate()
 		var rot := randi_range(0, 3)
 		match rot:
 			1: castle_img.rotate_90(CLOCKWISE)
@@ -476,13 +578,8 @@ func _gen_castles() -> void:
 		if randf() < 0.5:
 			castle_img.flip_x()
 
-		for ly in range(FOOT):
-			for lx in range(FOOT):
-				if castle_img.get_pixel(lx, ly).get_luminance() > 0.5:
-					var gx := rx + lx
-					var gy := ry + ly
-					if gx >= 0 and gx < grid_width and gy >= 0 and gy < grid_height:
-						field.terrain[gy * grid_width + gx] = 1.0
+		terrain_img.blit_rect_mask(wall_src, castle_img, Rect2i(0, 0, FOOT, FOOT), Vector2i(rx, ry))
+		var walls := castle_img.get_data()  # LA8：alpha 在 (ly * FOOT + lx) * 2 + 1
 
 		castle_centers.append(Vector2i(rx + FOOT / 2, ry + FOOT / 2))
 
@@ -491,7 +588,7 @@ func _gen_castles() -> void:
 		var center_to_map := Vector2(float(mcx - (rx + FOOT / 2)), float(mcy - (ry + FOOT / 2)))
 		for lx in range(FOOT):
 			for ly in [0, FOOT - 1]:
-				if castle_img.get_pixel(lx, ly).get_luminance() < 0.5:
+				if walls[(ly * FOOT + lx) * 2 + 1] == 0:
 					var d := center_to_map.dot(Vector2(float(lx - FOOT / 2), float(ly - FOOT / 2)))
 					if d > best_dist:
 						continue
@@ -499,13 +596,15 @@ func _gen_castles() -> void:
 					best_exit = Vector2i(rx + lx, ry + ly)
 		for ly in range(FOOT):
 			for lx in [0, FOOT - 1]:
-				if castle_img.get_pixel(lx, ly).get_luminance() < 0.5:
+				if walls[(ly * FOOT + lx) * 2 + 1] == 0:
 					var d := center_to_map.dot(Vector2(float(lx - FOOT / 2), float(ly - FOOT / 2)))
 					if d > best_dist:
 						continue
 					best_dist = d
 					best_exit = Vector2i(rx + lx, ry + ly)
 		castle_exits.append(best_exit)
+
+	field.terrain = terrain_img.get_data().to_float32_array()
 
 
 func _setup_goals() -> void:
@@ -522,51 +621,89 @@ func _setup_goals() -> void:
 # ── Agents ───────────────────────────────────────────────────────────────
 
 func _spawn_agents() -> void:
-	agent_pos = PackedVector2Array(); agent_pos.resize(agent_count)
-	agent_vel = PackedVector2Array(); agent_vel.resize(agent_count)
-	display_pos = PackedVector2Array(); display_pos.resize(agent_count)
-	agent_equips = []
-	agent_factions = PackedInt32Array(); agent_factions.resize(agent_count)
+	if _equip_info.is_empty():
+		_build_equip_tables()
+	var n := agent_count
+	# 直接生成 GPU 要的 SoA 数组（长度 MAX_AGENTS，n 之后为 0）
+	var px := PackedFloat32Array(); px.resize(MAX_AGENTS)
+	var py := PackedFloat32Array(); py.resize(MAX_AGENTS)
+	var info := PackedInt32Array(); info.resize(MAX_AGENTS)
+	var rng := PackedFloat32Array(); rng.resize(MAX_AGENTS)
+	var dmg := PackedFloat32Array(); dmg.resize(MAX_AGENTS)
+	var equips := PackedByteArray(); equips.resize(n)
+	var t_info := _equip_info
+	var t_rng := _equip_range
+	var t_dmg := _equip_damage
+	var nc := castle_centers.size()
+	var ccx := PackedFloat32Array(); ccx.resize(nc)
+	var ccy := PackedFloat32Array(); ccy.resize(nc)
+	for f in range(nc):
+		ccx[f] = castle_centers[f].x
+		ccy[f] = castle_centers[f].y
+	var cs := cell_size
+	var x_lo := cell_size * 3.0
+	var x_hi := world_size.x - cell_size * 3.0
+	var y_lo := cell_size * 3.0
+	var y_hi := world_size.y - cell_size * 3.0
 
-	cpu_agent_info = PackedInt32Array(); cpu_agent_info.resize(MAX_AGENTS)
-	cpu_max_hp     = PackedInt32Array(); cpu_max_hp.resize(MAX_AGENTS)
-	cpu_regen_rate = PackedFloat32Array(); cpu_regen_rate.resize(MAX_AGENTS)
-	cpu_atk_range  = PackedFloat32Array(); cpu_atk_range.resize(MAX_AGENTS)
-	cpu_atk_damage = PackedFloat32Array(); cpu_atk_damage.resize(MAX_AGENTS)
-
-	for i in range(agent_count):
+	# 随机数的调用顺序和次数与原来的逐 agent 写法相同（固定 seed 下结果不变）
+	for i in range(n):
 		var faction := i % NUM_FACTIONS
-		agent_factions[i] = faction
-		if faction < castle_centers.size():
-			var cc := castle_centers[faction]
-			agent_pos[i] = Vector2(
-				(float(cc.x) + randf_range(-20.0, 20.0)) * cell_size,
-				(float(cc.y) + randf_range(-20.0, 20.0)) * cell_size)
+		if faction < nc:
+			px[i] = (ccx[faction] + randf_range(-20.0, 20.0)) * cs
+			py[i] = (ccy[faction] + randf_range(-20.0, 20.0)) * cs
 		else:
-			agent_pos[i] = Vector2(
-				randf_range(cell_size * 3.0, world_size.x - cell_size * 3.0),
-				randf_range(cell_size * 3.0, world_size.y - cell_size * 3.0))
-		agent_vel[i] = Vector2.ZERO
-		display_pos[i] = agent_pos[i]
+			px[i] = randf_range(x_lo, x_hi)
+			py[i] = randf_range(y_lo, y_hi)
 
-		# Equipment
-		var equips: Array = []
+		# Equipment（位掩码）
+		var m := 0
 		if randf() < 0.6:
-			equips.append(Equip.SWORD if randf() < 0.5 else Equip.SPEAR)
+			m = EQ_SWORD if randf() < 0.5 else EQ_SPEAR
 		if randf() < 0.4:
-			equips.append(Equip.BOW if randf() < 0.5 else Equip.CROSSBOW)
-		if equips.is_empty():
-			equips.append(Equip.SWORD)
+			m |= EQ_BOW if randf() < 0.5 else EQ_CROSSBOW
+		if m == 0:
+			m = EQ_SWORD
 		if randf() < 0.3:
-			equips.append(Equip.SHIELD)
-		agent_equips.append(equips)
+			m |= EQ_SHIELD
+		equips[i] = m
+		info[i] = t_info[m] | ((faction & 0x1F) << 1)
+		rng[i] = t_rng[m]
+		dmg[i] = t_dmg[m]
 
+	spawn_x = px
+	spawn_y = py
+	agent_equips = equips
+	# agent i 的阵营为 i % NUM_FACTIONS：一个周期倍增拼接
+	var fac := PackedInt32Array()
+	for f in range(NUM_FACTIONS):
+		fac.append(f)
+	while fac.size() < n:
+		fac.append_array(fac)
+	fac.resize(n)
+	agent_factions = fac
+	cpu_agent_info = info
+	cpu_max_hp = PackedInt32Array(); cpu_max_hp.resize(n); cpu_max_hp.fill(20000); cpu_max_hp.resize(MAX_AGENTS)
+	cpu_regen_rate = PackedFloat32Array(); cpu_regen_rate.resize(n); cpu_regen_rate.fill(2.0); cpu_regen_rate.resize(MAX_AGENTS)
+	cpu_atk_range = rng
+	cpu_atk_damage = dmg
+
+
+# 装备位掩码 → info 的存活/近战/远程/盾位、射程、伤害；累计规则同原来逐件遍历 EQUIP_DB
+func _build_equip_tables() -> void:
+	var count := 1 << Equip.size()
+	_equip_info = PackedInt32Array(); _equip_info.resize(count)
+	_equip_range = PackedFloat32Array(); _equip_range.resize(count)
+	_equip_damage = PackedFloat32Array(); _equip_damage.resize(count)
+	for m in range(count):
 		var has_melee := false
 		var has_ranged := false
 		var has_shield := false
 		var best_range := 0.0
 		var best_dmg := 0.0
-		for e in equips:
+		for e in Equip.values():
+			if (m & (1 << e)) == 0:
+				continue
 			var db: Dictionary = EQUIP_DB[e]
 			if db.melee:
 				has_melee = true
@@ -578,16 +715,12 @@ func _spawn_agents() -> void:
 			best_dmg = maxf(best_dmg, db.damage)
 
 		var info: int = 1
-		info |= (faction & 0x1F) << 1
 		if has_melee:  info |= (1 << 6)
 		if has_ranged: info |= (1 << 7)
 		if has_shield: info |= (1 << 8)
-
-		cpu_agent_info[i] = info
-		cpu_max_hp[i] = 20000
-		cpu_regen_rate[i] = 2.0
-		cpu_atk_range[i] = best_range
-		cpu_atk_damage[i] = best_dmg
+		_equip_info[m] = info
+		_equip_range[m] = best_range
+		_equip_damage[m] = best_dmg
 
 
 func _upload_combat() -> void:
@@ -600,19 +733,25 @@ func _upload_combat() -> void:
 
 # ── Brush painting ───────────────────────────────────────────────────────
 
+# terrain 直接作为 RF 纹理（墙色由 _wall_sprite 的 shader 决定）：首次新建，之后 update() 复用
 func _rebuild_wall_texture() -> void:
-	var img := Image.create(grid_width, grid_height, false, Image.FORMAT_RGBA8)
-	img.fill(Color(0, 0, 0, 0))
-	var t := field.terrain
-	var w := grid_width
-	for y in range(grid_height):
-		var row := y * w
-		for x in range(w):
-			if t[row + x] > 0.5:
-				img.set_pixel(x, y, Color(0.35, 0.35, 0.42, 1.0))
-	_wall_sprite.texture = ImageTexture.create_from_image(img)
+	var img := Image.create_from_data(grid_width, grid_height, false, Image.FORMAT_RF, field.terrain.to_byte_array())
+	var tex := _wall_sprite.texture as ImageTexture
+	if tex == null:
+		_wall_sprite.texture = ImageTexture.create_from_image(img)
+	else:
+		tex.update(img)
 	_wall_tex_dirty = false
 
+
+func _rebuild_ground_texture() -> void:
+	var img := Image.create_from_data(grid_width, grid_height, false, Image.FORMAT_RF, field.ground_cost.to_byte_array())
+	var tex := _ground_sprite.texture as ImageTexture
+	if tex == null:
+		_ground_sprite.texture = ImageTexture.create_from_image(img)
+	else:
+		tex.update(img)
+	_ground_tex_dirty = false
 
 
 func _apply_brush(world_pos: Vector2) -> void:
@@ -638,11 +777,24 @@ func _apply_brush(world_pos: Vector2) -> void:
 					changed = true
 					terrain_dirty = true
 
+			elif brush_mode == BrushMode.GROUND:
+				if field.terrain[gi] > 0.5:
+					continue
+				var want := 1.0 if paint_erase else brush_ground_cost
+				if field.ground_cost[gi] != want:
+					field.ground_cost[gi] = want
+					changed = true
+					ground_dirty = true
+
 			elif brush_mode == BrushMode.ERASE:
 				if field.terrain[gi] > 0.5:
 					field.terrain[gi] = 0.0
 					changed = true
 					terrain_dirty = true
+				if field.ground_cost[gi] != 1.0:
+					field.ground_cost[gi] = 1.0
+					changed = true
+					ground_dirty = true
 
 	if changed:
 		queue_redraw()
@@ -653,8 +805,14 @@ func _flush_paint() -> void:
 		field._upload(field.buf_terrain, field.terrain)
 		_wall_tex_dirty = true
 		terrain_dirty = false
+	if ground_dirty:
+		field._upload(field.buf_ground_cost, field.ground_cost)
+		_ground_tex_dirty = true
+		ground_dirty = false
 	if _wall_tex_dirty:
 		_rebuild_wall_texture()
+	if _ground_tex_dirty:
+		_rebuild_ground_texture()
 
 
 # ── MultiMesh ────────────────────────────────────────────────────────────
@@ -781,11 +939,10 @@ func _hide_overlay() -> void:
 func _cleanup_overlay() -> void:
 	if rd == null:
 		return
-	# _blk_uset 依赖 _ov_shd，先于下面的释放
-	for rid in [_blk_uset, _blk_buf_rgba]:
-		if rid.is_valid():
-			rd.free_rid(rid)
-	for rid in [_ov_uset, _ov_pip, _ov_shd, _ov_buf_rgba]:
+	# uniform set 先放（依赖 _ov_shd 和各缓冲）；已被 Godot 连带释放的跳过
+	for us in [_blk_uset, _ov_uset]:
+		if us.is_valid() and rd.uniform_set_is_valid(us): rd.free_rid(us)
+	for rid in [_blk_buf_rgba, _ov_pip, _ov_shd, _ov_buf_rgba]:
 		if rid.is_valid():
 			rd.free_rid(rid)
 
@@ -823,58 +980,16 @@ func _sync_multimesh_gpu() -> void:
 	perf_mm_set_buffer    = lerpf(perf_mm_set_buffer, float(tc - tb) / 1000.0, alpha)
 
 
-func _sync_multimesh_cpu() -> void:
-	var ta := Time.get_ticks_usec()
-	cached_info = agents.readback_agent_info()
-	var tb := Time.get_ticks_usec()
-	cached_damage = agents.readback_damage_acc()
-	var tc := Time.get_ticks_usec()
-	alive_count = 0
-	var stride := 12
-	var buf_size := agent_count * stride
-	if mm_buf.size() != buf_size:
-		mm_buf.resize(buf_size)
-	var info := cached_info
-	var dmg := cached_damage
-	var hp := cpu_max_hp
-	var dpos := display_pos
-	var colors := faction_colors
-	var cnt := agent_count
-	var alive := 0
-	for i in range(cnt):
-		var off := i * stride
-		var ainfo := info[i]
-		if (ainfo & 1) != 0:
-			var fac := (ainfo >> 1) & 0x1F
-			var inv_hp := 1.0 / maxf(float(hp[i]), 1.0)
-			var brightness := lerpf(0.2, 1.0, 1.0 - clampf(float(dmg[i]) * inv_hp, 0.0, 1.0))
-			var c: Color = colors[fac]
-			var p: Vector2 = dpos[i]
-			mm_buf[off]     = 1.0;  mm_buf[off + 1] = 0.0
-			mm_buf[off + 2] = 0.0;  mm_buf[off + 3] = p.x
-			mm_buf[off + 4] = 0.0;  mm_buf[off + 5] = 1.0
-			mm_buf[off + 6] = 0.0;  mm_buf[off + 7] = p.y
-			mm_buf[off + 8]  = c.r * brightness
-			mm_buf[off + 9]  = c.g * brightness
-			mm_buf[off + 10] = c.b * brightness
-			mm_buf[off + 11] = 1.0
-			alive += 1
-		else:
-			mm_buf[off]     = 1.0;  mm_buf[off + 1] = 0.0
-			mm_buf[off + 2] = 0.0;  mm_buf[off + 3] = -10000.0
-			mm_buf[off + 4] = 0.0;  mm_buf[off + 5] = 1.0
-			mm_buf[off + 6] = 0.0;  mm_buf[off + 7] = -10000.0
-			mm_buf[off + 8]  = 0.0;  mm_buf[off + 9]  = 0.0
-			mm_buf[off + 10] = 0.0;  mm_buf[off + 11] = 0.0
-	var td := Time.get_ticks_usec()
-	alive_count = alive
-	multi_mesh.set_buffer(mm_buf)
-	var te := Time.get_ticks_usec()
-	var a := perf_alpha
-	perf_mm_readback_info = lerpf(perf_mm_readback_info, float(tb - ta) / 1000.0, a)
-	perf_mm_readback_dmg  = lerpf(perf_mm_readback_dmg,  float(tc - tb) / 1000.0, a)
-	perf_mm_loop          = lerpf(perf_mm_loop,          float(td - tc) / 1000.0, a)
-	perf_mm_set_buffer    = lerpf(perf_mm_set_buffer,    float(te - td) / 1000.0, a)
+# 重置 / 改数量后：在 GPU 上按刚上传的出生位置构建一次 MultiMesh，随这次提交回读（暂停时画面也立即正确）
+func _rebuild_multimesh() -> void:
+	agents.reset_alive_counter()
+	var cl := rd.compute_list_begin()
+	agents.dispatch_build_mm(cl, 1.0, true)
+	rd.compute_list_end()
+	agents.request_frame_readback(agent_count)
+	rd.submit()
+	rd.sync()
+	_sync_multimesh_gpu()
 
 
 func _sync_laser_overlay() -> void:
@@ -975,7 +1090,10 @@ func _update_select_label() -> void:
 
 	var equip_names: PackedStringArray = PackedStringArray()
 	if idx < agent_equips.size():
-		for e in agent_equips[idx]:
+		var em := agent_equips[idx]
+		for e in Equip.values():
+			if (em & (1 << e)) == 0:
+				continue
 			match e:
 				Equip.SWORD:    equip_names.append("Sword")
 				Equip.SPEAR:    equip_names.append("Spear")
@@ -1120,8 +1238,9 @@ func _process(dt: float) -> void:
 			_apply_gi_world_scale(gi_region)
 			_update_gi_sprite_rect(gi_region)
 			var splat_radius := _world_to_gi_texels(_get_gi_agent_splat_radius_world(), gi_region)
+			# 激光读本帧主提交压缩出的紧凑列表（_sync_multimesh_gpu 刚取到的条数）
 			gi.compute_gi(agent_count, gi_region.position, gi_region.size,
-						   splat_radius, _gi_emit_strength)
+						   splat_radius, _gi_emit_strength, _laser_count)
 			var gi_img := gi.get_output_image()
 			if _gi_sprite.texture == null:
 				_gi_sprite.texture = ImageTexture.create_from_image(gi_img)
@@ -1365,6 +1484,7 @@ func _setup_hud() -> void:
 	vbox.add_child(_sep())
 	vbox.add_child(_lbl("Brush  [1]None [2]Wall [3]Erase"))
 	var brush_lbl := Label.new()
+	_brush_label = brush_lbl
 	brush_lbl.name = "BrushLabel"
 	brush_lbl.add_theme_font_size_override("font_size", 12)
 	brush_lbl.add_theme_color_override("font_color", Color(0.9, 0.75, 0.4))
@@ -1377,6 +1497,19 @@ func _setup_hud() -> void:
 		queue_redraw()
 	)
 	vbox.add_child(slider_brush)
+	var ground_button := Button.new()
+	ground_button.text = "[4] Ground: x%d | Speed: %d%%" % [int(brush_ground_cost), int(100.0 / brush_ground_cost)]
+	ground_button.tooltip_text = "Paint ground with LMB; RMB restores normal ground.\nDarker ground is harder to cross. [3] Erase clears walls and ground."
+	ground_button.pressed.connect(func(): _set_brush(BrushMode.GROUND))
+	vbox.add_child(ground_button)
+	var slider_ground := _slider(1, GPUSWEField.GROUND_COST_MAX, brush_ground_cost, 1)
+	slider_ground.tooltip_text = "Ground difficulty: 1 = normal, 2 = rough, 3 = mud, 4 = deep mud."
+	slider_ground.value_changed.connect(func(v: float):
+		brush_ground_cost = v
+		ground_button.text = "[4] Ground: x%d | Speed: %d%%" % [int(v), int(100.0 / v)]
+		_set_brush(BrushMode.GROUND)
+	)
+	vbox.add_child(slider_ground)
 
 	#_setup_minimap(canvas)
 
@@ -1476,6 +1609,7 @@ func _brush_name() -> String:
 	match brush_mode:
 		BrushMode.WALL: return "Wall"
 		BrushMode.ERASE: return "Erase"
+		BrushMode.GROUND: return "Ground x%d" % int(brush_ground_cost)
 		_: return "None"
 
 func _update_agent_label() -> void:
@@ -1530,16 +1664,14 @@ func _apply_agent_count() -> void:
 	_update_agent_label()
 	multi_mesh.instance_count = agent_count
 	multi_mesh.visible_instance_count = agent_count
-	mm_buf.resize(agent_count * 12)
 	_spawn_agents()
-	agents.upload_agents(agent_pos, agent_vel, agent_count)
+	agents.upload_agents(spawn_x, spawn_y, agent_count)
 	_upload_combat()
-	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
 	agents.clear_laser_events()
 	_laser_count = 0
 	agents.clear_hit_flash_events()
-	_sync_multimesh_cpu()
+	_rebuild_multimesh()
 	_sync_laser_overlay()
 
 func _toggle_pause() -> void:
@@ -1552,23 +1684,26 @@ func _reset_sim() -> void:
 	nearest_enemy = -1
 	field.reset_flux()
 	field.terrain.fill(0.0)
+	ground_dirty = false
+	terrain_dirty = false
+	_ground_tex_dirty = true
 	field.add_wall(0, 0, grid_width, 1)
 	field.add_wall(0, grid_height - 1, grid_width, grid_height)
 	field.add_wall(0, 0, 1, grid_height)
 	field.add_wall(grid_width - 1, 0, grid_width, grid_height)
 	_gen_castles()
+	_generate_ground()
 	_wall_tex_dirty = true
 	_spawn_agents()
-	agents.upload_agents(agent_pos, agent_vel, agent_count)
+	agents.upload_agents(spawn_x, spawn_y, agent_count)
 	_upload_combat()
-	agents.upload_display_pos(agent_pos, agent_count)
 	agents.clear_corpse_map()
 	agents.clear_laser_events()
 	_laser_count = 0
 	agents.clear_hit_flash_events()
-	_setup_goals()
 	field.upload_static_data()
-	_sync_multimesh_cpu()
+	_setup_goals()  # GPU BFS 读地形，放在地形上传之后
+	_rebuild_multimesh()
 	_sync_laser_overlay()
 
 
@@ -1622,6 +1757,7 @@ func _draw() -> void:
 		match brush_mode:
 			BrushMode.WALL:  col = Color(0.4, 0.8, 1.0, 0.35)
 			BrushMode.ERASE: col = Color(1.0, 0.4, 0.4, 0.35)
+			BrushMode.GROUND: col = Color(0.85, 0.6, 0.25, 0.55)
 			_:               col = Color(1, 1, 1, 0.2)
 		draw_arc(mpos, brush_radius * cs_val, 0, TAU, 32, col, 1.5)
 		var cx := int(mpos.x / cs_val)
@@ -1651,6 +1787,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_gi_enabled = not _gi_enabled
 				if _gi_sprite:
 					_gi_sprite.visible = _gi_enabled
+				# 关闭期间的 history 已过时，重新打开时不再与它混合
+				if _gi_enabled and gi: gi.temporal_valid = false
 			KEY_F12:
 				var img := get_viewport().get_texture().get_image()
 				var path := "user://screenshot_%d.png" % Time.get_ticks_msec()
@@ -1659,6 +1797,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_1: _set_brush(BrushMode.NONE)
 			KEY_2: _set_brush(BrushMode.WALL)
 			KEY_3: _set_brush(BrushMode.ERASE)
+			KEY_4: _set_brush(BrushMode.GROUND)
 
 	if brush_mode == BrushMode.NONE:
 		if event is InputEventMouseButton:
@@ -1711,7 +1850,7 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _set_brush(mode: BrushMode) -> void:
 	brush_mode = mode
-	var lbl := get_node_or_null("CanvasLayer/PanelContainer/VBoxContainer/BrushLabel") as Label
-	if lbl:
-		lbl.text = "Mode: %s | Radius: %d" % [_brush_name(), brush_radius]
+	is_painting = false
+	if _brush_label:
+		_brush_label.text = "Mode: %s | Radius: %d" % [_brush_name(), brush_radius]
 	queue_redraw()

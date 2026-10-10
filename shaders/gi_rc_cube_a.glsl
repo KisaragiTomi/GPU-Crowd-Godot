@@ -5,38 +5,52 @@
 // by Suslik / fad 
 
 
-// This buffer calculates and merges radiance cascades. Normally the
-// merging would happen within one frame (like a mipmap calculation),
-// meaning this technique actually has no termporal lag - but since
-// Shadertoy has no way of running a pass multiple times per frame, we 
-// have to resort to spreading out the merging of cascades over multiple
-// frames.
+// This buffer calculates and merges radiance cascades. The shadertoy original
+// spread the merging over multiple frames; here GPUGI dispatches one cascade at
+// a time from the highest to cascade 0 (barrier in between), so every cascade
+// reads the cascade above it from the same GI update.
 
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0, std430) buffer ConstBuffer {
-    uint add_data;
-} consts;
-
-// cascades was iChannel0
-layout(set = 0, binding = 10, rgba32f) uniform image2D cascades_image_0;
-layout(set = 0, binding = 11, rgba32f) uniform image2D cascades_image_1;
-layout(set = 0, binding = 12, rgba32f) uniform image2D cascades_image_2;
-layout(set = 0, binding = 13, rgba32f) uniform image2D cascades_image_3;
-layout(set = 0, binding = 14, rgba32f) uniform image2D cascades_image_4;
-layout(set = 0, binding = 15, rgba32f) uniform image2D cascades_image_5;
+// 所有 cascade 按线性像素下标紧凑存放在一张纹理里：pixel_index -> (idx % CASCADE_TEX_W, idx / CASCADE_TEX_W)
+const int CASCADE_TEX_W_SHIFT = 11;
+const int CASCADE_TEX_W = 1 << CASCADE_TEX_W_SHIFT;  // 须与 GPUGI.CASCADE_TEX_W 一致
+// 本 pass 写第 cascade_index 级、读第 cascade_index + 1 级（上一次 dispatch 已写完）
+layout(set = 0, binding = 10, rgba16f) uniform image2D cascades_image;
 // emissivity was iChannel1
-layout(set=0,binding=2,rgba32f)readonly uniform image2D input_image;
-layout(set=0,binding=3,rgba32f)readonly uniform image2D distance_image;
+layout(set=0,binding=2,rgba16f)readonly uniform image2D input_image;
+layout(set=0,binding=3,r32f)readonly uniform image2D distance_image;
 
-layout(set = 0, binding = 1, std430) restrict readonly buffer ParamsBuffer {
-    int cascade_index; // Current cascade level
-    int num_cascades; // Total number of cascades
-    int cascade_size_x; // Size of each cascade
-    int cascade_size_y; // Size of each cascade
-    int merge_fix; // MERGE_FIX
+layout(set = 0, binding = 0, std430) restrict readonly buffer GIParamsBuffer {
+    int   agent_count;
+    float tex_w;
+    float tex_h;
+    float region_x;
+    float region_y;
+    float region_w;
+    float region_h;
+    float splat_radius;
+    float emit_strength;
+    int   terrain_w;
+    int   terrain_h;
+    float terrain_cell_size;
+    float wall_alpha;
+    float laser_width;
+    float laser_emit_strength;
+    float laser_life;
+    int   laser_count;
+    int   laser_cap;
     float interval_scale;
+    float history_weight;
+    float spatial_strength;
+    int   num_cascades; // Total number of cascades
+    int   merge_fix; // MERGE_FIX
+};
+
+layout(set = 0, binding = 1, std430) restrict readonly buffer CascadeParamsBuffer {
+    int cascade_index; // Current cascade level
+    int cascade_pixel_count; // 本级像素数（线程数）
 };
 
 //================================================================================================================
@@ -94,38 +108,16 @@ float GetC0IntervalLength(ivec2 viewport_size)
 
 // vec2 screenRes;
 
-// vec4 cubemapFetch(samplerCube sampler, int face, ivec2 P) {
-vec4 cubemapFetch(int face, ivec2 P) {
-    // Look up a single texel in a cubemap
-    // ivec2 cubemapRes = textureSize(sampler, 0);
-    ivec2 cubemapRes = imageSize(cascades_image_0).xy;
-    if (clamp(P, ivec2(0), cubemapRes - 1) != P || face < 0 || face > 5) {
-        return vec4(0.0);
-    }
+ivec2 CascadeTexel(int pixel_index)
+{
+    return ivec2(pixel_index & (CASCADE_TEX_W - 1), pixel_index >> CASCADE_TEX_W_SHIFT);
+}
 
-    // vec2 p = (vec2(P) + 0.5) / vec2(cubemapRes) * 2.0 - 1.0;
-    // vec3 c;
-    
-    // switch (face) {
-    //     case 0: c = vec3( 1.0, -p.y, -p.x); break;
-    //     case 1: c = vec3(-1.0, -p.y,  p.x); break;
-    //     case 2: c = vec3( p.x,  1.0,  p.y); break;
-    //     case 3: c = vec3( p.x, -1.0, -p.y); break;
-    //     case 4: c = vec3( p.x, -p.y,  1.0); break;
-    //     case 5: c = vec3(-p.x, -p.y, -1.0); break;
-    // }
-    
-    // return texture(sampler, normalize(c));
-    vec4 data = ivec4(0);
-    switch (face) {
-        case 0: data = imageLoad(cascades_image_0, P); break;
-        case 1: data = imageLoad(cascades_image_1, P); break;
-        case 2: data = imageLoad(cascades_image_2, P); break;
-        case 3: data = imageLoad(cascades_image_3, P); break;
-        case 4: data = imageLoad(cascades_image_4, P); break;
-        case 5: data = imageLoad(cascades_image_5, P); break;
-    }
-    return data;
+vec4 cascadeFetch(int pixel_index) {
+    // Look up a single texel of the packed cascade storage
+    ivec2 P = CascadeTexel(pixel_index);
+    if (pixel_index < 0 || P.y >= imageSize(cascades_image).y) return vec4(0.0);
+    return imageLoad(cascades_image, P);
 }
 
 ivec2 roundSDim(ivec2 v) {
@@ -250,14 +242,6 @@ ProbeLocation PixelIndexToProbeLocation(int pixel_index, CascadeSize c0_size)
     int probe_linear_index = offset_in_cascade / cascade_size.dirs_count;
     probe_location.probe_index = ivec2(probe_linear_index % cascade_size.probes_count.x, probe_linear_index / cascade_size.probes_count.x);
     return probe_location;
-}
-ivec3 PixelIndexToCubemapTexel(ivec2 face_size, int pixel_index)
-{
-    int face_pixels_count = face_size.x * face_size.y;
-    int face_index = pixel_index / face_pixels_count;
-    int face_pixel_index = pixel_index - face_pixels_count * face_index;
-    ivec2 face_pixel = ivec2(face_pixel_index % face_size.x, face_pixel_index / face_size.x);
-    return ivec3(face_pixel, face_index);
 }
 
 vec2 GetProbeScreenSize(int cascade_index, CascadeSize c0_size)
@@ -517,9 +501,7 @@ vec3 integrateSkyRadiance(vec2 angle) {
 
 vec4 CastMergedInterval(vec2 screen_pos, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -541,12 +523,11 @@ vec4 CastMergedInterval(vec2 screen_pos, vec2 dir, vec2 interval_length, int pre
 
 
         int pixel_index = ProbeLocationToPixelIndex(prev_probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
 
         vec4 prev_interval = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         // if(prev_cascade_index < nCascades)
         if(prev_cascade_index < num_cascades)
-            prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+            prev_interval = cascadeFetch(pixel_index);
 
         prev_interp_interval += prev_interval * weights[i];
     }
@@ -555,9 +536,7 @@ vec4 CastMergedInterval(vec2 screen_pos, vec2 dir, vec2 interval_length, int pre
 
 vec4 InterpProbeDir(ivec2 probe_index, int cascade_index, float dir_indexf)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize cascade_size = GetCascadeSize(cascade_index, c0_size);
@@ -573,9 +552,8 @@ vec4 InterpProbeDir(ivec2 probe_index, int cascade_index, float dir_indexf)
         probe_location.dir_index = (dir_samples.base_index + i + cascade_size.dirs_count) % cascade_size.dirs_count;
         
         int pixel_index = ProbeLocationToPixelIndex(probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
         
-        vec4 prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+        vec4 prev_interval = cascadeFetch(pixel_index);
         interp_interval += prev_interval * weights[i];
     }
     return interp_interval;
@@ -583,9 +561,7 @@ vec4 InterpProbeDir(ivec2 probe_index, int cascade_index, float dir_indexf)
 
 vec4 CastMergedIntervalParallaxFix(vec2 screen_pos, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -618,9 +594,7 @@ vec4 CastMergedIntervalParallaxFix(vec2 screen_pos, vec2 dir, vec2 interval_leng
 
 vec4 CastMergedIntervalBilinearFix(vec2 screen_pos, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -637,12 +611,11 @@ vec4 CastMergedIntervalBilinearFix(vec2 screen_pos, vec2 dir, vec2 interval_leng
 
 
         int pixel_index = ProbeLocationToPixelIndex(prev_probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
 
         vec4 prev_interval = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         // if(prev_cascade_index < nCascades)
         if(prev_cascade_index < num_cascades)
-            prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+            prev_interval = cascadeFetch(pixel_index);
 
         vec2 prev_screen_pos = GetProbeScreenPos(vec2(prev_probe_location.probe_index), prev_probe_location.cascade_index, c0_size);
 
@@ -658,9 +631,7 @@ vec4 CastMergedIntervalBilinearFix(vec2 screen_pos, vec2 dir, vec2 interval_leng
 vec4 CastMergedIntervalMidpointBilinearFix(vec2 screen_pos, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
 
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -686,12 +657,11 @@ vec4 CastMergedIntervalMidpointBilinearFix(vec2 screen_pos, vec2 dir, vec2 inter
 
 
         int pixel_index = ProbeLocationToPixelIndex(prev_probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
 
         vec4 prev_interval = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         // if(prev_cascade_index < nCascades)
         if(prev_cascade_index < num_cascades)
-            prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+            prev_interval = cascadeFetch(pixel_index);
 
         vec2 prev_screen_pos = GetProbeScreenPos(vec2(prev_probe_location.probe_index), prev_probe_location.cascade_index, c0_size);
 
@@ -709,9 +679,7 @@ vec4 CastMergedIntervalMidpointBilinearFix(vec2 screen_pos, vec2 dir, vec2 inter
 vec4 CastMergedIntervalMaskFix(vec2 screen_pos, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
 
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -753,12 +721,11 @@ vec4 CastMergedIntervalMaskFix(vec2 screen_pos, vec2 dir, vec2 interval_length, 
 
 
         int pixel_index = ProbeLocationToPixelIndex(prev_probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
 
         vec4 prev_interval = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         // if(prev_cascade_index < nCascades)
         if(prev_cascade_index < num_cascades)
-            prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+            prev_interval = cascadeFetch(pixel_index);
         prev_interp_interval += prev_interval * weights[i];
     }
     return MergeIntervals(ray_interval, prev_interp_interval);
@@ -766,9 +733,7 @@ vec4 CastMergedIntervalMaskFix(vec2 screen_pos, vec2 dir, vec2 interval_length, 
 
 vec4 CastInterpProbeDir(ivec2 probe_index, int cascade_index, vec2 interval_length, float dir_indexf)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize cascade_size = GetCascadeSize(cascade_index, c0_size);
@@ -794,9 +759,7 @@ vec4 CastInterpProbeDir(ivec2 probe_index, int cascade_index, vec2 interval_leng
 
 vec4 CastMergedIntervalInnerParallaxFix(ivec2 probe_index, vec2 dir, vec2 interval_length, int prev_cascade_index, int prev_dir_index)
 {
-    // ivec2 face_size = textureSize(iChannel0, 0);    
     // ivec2 viewport_size = textureSize(iChannel1, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
     CascadeSize prev_cascade_size = GetCascadeSize(prev_cascade_index, c0_size);
@@ -815,12 +778,11 @@ vec4 CastMergedIntervalInnerParallaxFix(ivec2 probe_index, vec2 dir, vec2 interv
 
 
         int pixel_index = ProbeLocationToPixelIndex(prev_probe_location, c0_size);
-        ivec3 texel_index = PixelIndexToCubemapTexel(face_size, pixel_index);
 
         vec4 prev_interval = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         // if(prev_cascade_index < nCascades)
         if(prev_cascade_index < num_cascades)
-            prev_interval = cubemapFetch(texel_index.z, texel_index.xy);
+            prev_interval = cascadeFetch(pixel_index);
 
         vec2 prev_screen_pos = GetProbeScreenPos(vec2(prev_probe_location.probe_index), prev_probe_location.cascade_index, c0_size);
 
@@ -854,35 +816,33 @@ vec4 CastMergedIntervalInnerParallaxFix(ivec2 probe_index, vec2 dir, vec2 interv
 void main() {
     // debug_main();
     // return;
-    vec2 fragCoord = gl_GlobalInvocationID.xy;
-    ivec2 ifragCoord = ivec2(fragCoord.xy);
+    // 线程下标 = 本级内的线性偏移（组数超过 65535 时 GPUGI 会派发成二维）
+    int offset_in_cascade = int(gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x + gl_GlobalInvocationID.x);
+    if (offset_in_cascade >= cascade_pixel_count) return;
     vec4 fragColor = vec4(1.0, 1.0, 0.0, 1.0);
     // float MAX_FLOAT = uintBitsToFloat(0x7f7fffff);
     // vec3 fragRO, vec3 fragRD;
-    int face = cascade_index;
-    
-    // ivec2 face_size = textureSize(iChannel0, 0);
-    ivec2 face_size = imageSize(cascades_image_0).xy;
-    ivec2 face_pixel = ivec2(fragCoord.xy);
-    int face_index = face;
-    int pixel_index = face_pixel.x + face_pixel.y * face_size.x + face_index * (face_size.x * face_size.y);
     // ivec2 viewport_size = textureSize(iChannel1, 0);
     ivec2 viewport_size = imageSize(input_image).xy;
     CascadeSize c0_size = GetC0Size(viewport_size);
-    ProbeLocation probe_location = PixelIndexToProbeLocation(pixel_index, c0_size);
-    
-    if(probe_location.cascade_index >= num_cascades)
-    {
-        switch (face) {
-            case 0: imageStore(cascades_image_0, ifragCoord, vec4(0.0)); break;
-            case 1: imageStore(cascades_image_1, ifragCoord, vec4(0.0)); break;
-            case 2: imageStore(cascades_image_2, ifragCoord, vec4(0.0)); break;
-            case 3: imageStore(cascades_image_3, ifragCoord, vec4(0.0)); break;
-            case 4: imageStore(cascades_image_4, ifragCoord, vec4(0.0)); break;
-            case 5: imageStore(cascades_image_5, ifragCoord, vec4(0.0)); break;
-        }
-        return;
+    // 级别已知，不用 PixelIndexToProbeLocation 搜索；线程到 (探针, 方向) 的分配只影响执行顺序、不影响结果：
+    // 高级 cascade 光线长，按"同方向、相邻探针"排列让同一 warp 的光线近似平行、读距离场更连贯；
+    // 低级 cascade 光线短，按存储顺序（同探针的各方向）更快
+    ProbeLocation probe_location;
+    probe_location.cascade_index = cascade_index;
+    CascadeSize location_size = GetCascadeSize(cascade_index, c0_size);
+    int probe_linear_index;
+    if (cascade_index >= 2) {
+        int probes_total = location_size.probes_count.x * location_size.probes_count.y;
+        probe_location.dir_index = offset_in_cascade / probes_total;
+        probe_linear_index = offset_in_cascade % probes_total;
+    } else {
+        probe_location.dir_index = offset_in_cascade % location_size.dirs_count;
+        probe_linear_index = offset_in_cascade / location_size.dirs_count;
     }
+    probe_location.probe_index = ivec2(probe_linear_index % location_size.probes_count.x, probe_linear_index / location_size.probes_count.x);
+    int pixel_index = GetCascadeLinearOffset(cascade_index, c0_size) + probe_linear_index * location_size.dirs_count + probe_location.dir_index;
+
     vec2 interval_overlap = vec2(1.0f, 1.0f);
     // #if MERGE_FIX == 4 || MERGE_FIX == 5 //parallax fix works better with overlapping intervals
     if (merge_fix == 4 || merge_fix == 5)
@@ -921,13 +881,5 @@ void main() {
     }
     fragColor = merged_avg_interval;
     //fragColor = vec4(0.2,0.5,1.,1);
-    // imageStore(cascades_image_0, fragCoord, fragColor);
-    switch (face) {
-        case 0: imageStore(cascades_image_0, ifragCoord, fragColor); break;
-        case 1: imageStore(cascades_image_1, ifragCoord, fragColor); break;
-        case 2: imageStore(cascades_image_2, ifragCoord, fragColor); break;
-        case 3: imageStore(cascades_image_3, ifragCoord, fragColor); break;
-        case 4: imageStore(cascades_image_4, ifragCoord, fragColor); break;
-        case 5: imageStore(cascades_image_5, ifragCoord, fragColor); break;
-    }    
+    imageStore(cascades_image, CascadeTexel(pixel_index), fragColor);
 }

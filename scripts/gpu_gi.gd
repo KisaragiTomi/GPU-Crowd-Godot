@@ -4,64 +4,60 @@ extends RefCounted
 ## Radiance Cascades GI driven by an agent emission map.
 ##
 ## Per GI update:
-## 1. Clear the emission image.
-## 2. Stamp walls into the same alpha mask as black blockers.
-## 3. Splat every live agent into the emission image.
-## 4. Stamp short ranged-attack laser segments into the emission image.
-## 5. Build a distance field from the emission/blocker alpha mask with JFA.
-## 6. Run the copied 6-face Radiance Cascades pass.
-## 7. Resolve cascade 0 into a raw GI image.
-## 8. Denoise and temporally stabilize the display image.
+## 1. 清空 emission 累加缓冲并写入墙体遮挡（一个逐像素 pass）。
+## 2. 一次 dispatch 画所有 agent 光斑和远程激光（激光读 GPUAgents 的紧凑列表，每条分段并行），atomicMax 累加。
+## 3. 累加结果转成 RGBA16F emission 纹理，同时生成 JFA 种子（R32UI 像素坐标）。
+## 4. JFA → R32F 距离场。
+## 5. Radiance cascades：从最高级到 0 级逐级派发，每级只覆盖本级像素；所有级紧凑存放在一张 RGBA16F 纹理里。
+## 6. 把 cascade 0 解算成 tonemap 后的 GI 图。
+## 7. 空间降噪 + 时间稳定（history 为 RGBA16F），同时写 RGBA8 显示纹理供回读。
 
-const DEFAULT_CASCADE_SIZE := Vector2i(1024, 1024)
 const DEFAULT_NUM_CASCADES := 6
 const DEFAULT_MERGE_FIX := 4
+const CASCADE_TEX_W := 2048  # cascade 紧凑纹理的宽度，须与 gi_rc_cube_a / gi_rc_image 的 CASCADE_TEX_W 一致
+const LASER_THREADS := 16  # 每条激光的线程数，须与 gi_agent_emit.glsl 一致
+const PARAMS_SIZE := 96
 
 var rd: RenderingDevice
 
 var tex_w: int
 var tex_h: int
-var cascade_size := DEFAULT_CASCADE_SIZE
 var num_cascades := DEFAULT_NUM_CASCADES
 var merge_fix := DEFAULT_MERGE_FIX
 var jfa_passes: int
+# 每级 cascade 的像素数与线性偏移（与 shader 的 GetCascadeSize / GetCascadeLinearOffset 同一公式）
+var cascade_counts := PackedInt32Array()
+var cascade_offsets := PackedInt32Array()
+var cascade_tex_h: int
 
-var consts_buf: RID
-var emit_params_buf: RID
-var image_params_buf: RID
-var temporal_params_buf: RID
+var params_buf: RID  # 每次 GI 更新写一次，布局见 _update_params
+var buf_emit_acc: RID  # 每像素 uvec4：emission rgba 的 fp32 位模式，供 atomicMax
 var jfa_params_bufs: Array[RID] = []
-var cube_params_bufs: Array[RID] = []
+var cascade_params_bufs: Array[RID] = []
 
-var tex_emit: RID
-var tex_output: RID
-var tex_history: RID
-var tex_stable: RID
-var tex_display: RID
-var tex_jfa: RID
-var tex_jfa_prev: RID
-var tex_distance: RID
-var cascade_textures: Array[RID] = []
+var tex_emit: RID  # RGBA16F
+var tex_jfa: Array[RID] = []  # R32UI ping-pong：最近种子的像素坐标 x | y << 16，0 = 无
+var tex_distance: RID  # R32F
+var tex_cascades: RID  # RGBA16F，CASCADE_TEX_W × cascade_tex_h
+var tex_output: RID  # RGBA16F，tonemap 后的 GI
+var tex_history: Array[RID] = []  # RGBA16F ping-pong
+var tex_display: RID  # RGBA8，回读后显示
 
-var shd_clear: RID
+var shd_wall_mask: RID
 var shd_emit: RID
-var shd_laser_emit: RID
 var shd_seed: RID
 var shd_jfa: RID
 var shd_distance: RID
-var shd_wall_mask: RID
 var shd_cube_a: RID
 var shd_image: RID
 var shd_stabilize: RID
 var shd_resample: RID
 
-var pip_clear: RID
+var pip_wall_mask: RID
 var pip_emit: RID
-var pip_laser_emit: RID
 var pip_seed: RID
 var pip_jfa: RID
 var pip_distance: RID
-var pip_wall_mask: RID
 var pip_cube_a: RID
 var pip_image: RID
 var pip_stabilize: RID
@@ -72,8 +68,8 @@ var buf_pos_y: RID
 var buf_agent_info: RID
 var buf_fac_colors: RID
 var buf_hit_flash: RID
-var buf_laser_lines: RID
-var buf_laser_ttl: RID
+var buf_laser_compact: RID
+var laser_cap := 0
 var buf_terrain: RID
 var terrain_grid_w: int
 var terrain_grid_h: int
@@ -88,48 +84,57 @@ var temporal_valid := false
 var _last_region_origin := Vector2.ZERO
 var _last_region_size := Vector2.ZERO
 
-# Debug: 0 = emission map, 1 = JFA seed/result, 2 = distance field,
-# 3 = first cascade face, 4 = final GI.
+# Debug: 0 = emission map, 1 = JFA seeds, 2 = distance field,
+# 3 = cascade storage (all cascades packed), 4 = final GI.
 var debug_stage: int = 4
 
-var _frame_uniform_sets: Array[RID] = []
-var _out_tex: RID  # _finish_compute 里登记异步回读的纹理
-var _out_raw := PackedByteArray()  # 该纹理随 sync() 到达的数据
+# uniform set 全部预建 / 缓存，不再每次 GI 更新新建再释放
+var _us_seed: RID
+var _us_jfa: Array[RID] = []  # 第 k 遍：读 tex_jfa[k % 2]，写 tex_jfa[(k + 1) % 2]
+var _us_distance: RID
+var _us_cascade: Array[RID] = []
+var _us_image: RID
+var _us_stabilize: Array[RID] = []  # [h]：读 tex_history[h]，写 tex_history[1 - h]
+var _us_resample: RID
+var _us_wall: RID
+var _us_wall_terrain: RID  # _us_wall 绑定的地形缓冲
+var _us_emit := {}  # [pos_x, pos_y, info, colors, hit_flash, laser] -> uniform set（位置是双缓冲，通常两份）
+var _hist := 0  # 当前 history 在 tex_history 里的下标
+var _emit_agents := 0  # 本次 emission dispatch 的 agent 线程数
+var _emit_lasers := 0  # 本次 emission dispatch 的激光条数
+var _out_raw := PackedByteArray()  # _finish_compute 登记、随 sync() 到达的显示纹理数据
 
 
 func _init(rendering_device: RenderingDevice, width: int, height: int,
-		p_cascade_size: Vector2i = DEFAULT_CASCADE_SIZE,
 		p_num_cascades: int = DEFAULT_NUM_CASCADES,
 		p_merge_fix: int = DEFAULT_MERGE_FIX) -> void:
 	rd = rendering_device
 	tex_w = width
 	tex_h = height
-	cascade_size = p_cascade_size
 	num_cascades = clampi(p_num_cascades, 1, 6)
 	merge_fix = clampi(p_merge_fix, 0, 5)
 	jfa_passes = ceili(log(float(maxi(tex_w, tex_h))) / log(2.0))
+	_compute_cascade_layout()
 
-	var cb := PackedInt32Array([0]).to_byte_array()
-	cb.resize(16)
-	consts_buf = rd.storage_buffer_create(cb.size(), cb)
-	emit_params_buf = rd.storage_buffer_create(64, _zero_bytes(16))
-	temporal_params_buf = rd.storage_buffer_create(16, _zero_bytes(4))
+	params_buf = rd.storage_buffer_create(PARAMS_SIZE, _zero_bytes(PARAMS_SIZE / 4))
+	buf_emit_acc = rd.storage_buffer_create(tex_w * tex_h * 16)
 	_create_static_param_buffers()
 
-	tex_emit = _create_tex(tex_w, tex_h)
-	tex_output = _create_tex(tex_w, tex_h)
-	tex_history = _create_tex(tex_w, tex_h)
-	tex_stable = _create_tex(tex_w, tex_h)
-	tex_display = tex_output
-	tex_jfa = _create_tex(tex_w, tex_h)
-	tex_jfa_prev = _create_tex(tex_w, tex_h)
-	tex_distance = _create_tex(tex_w, tex_h)
-
-	cascade_textures.clear()
-	for _i in range(6):
-		cascade_textures.append(_create_tex(cascade_size.x, cascade_size.y))
+	var rgba16f := RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
+	tex_emit = _create_tex(tex_w, tex_h, rgba16f)
+	for _i in range(2):
+		tex_jfa.append(_create_tex(tex_w, tex_h, RenderingDevice.DATA_FORMAT_R32_UINT))
+		tex_history.append(_create_tex(tex_w, tex_h, rgba16f))
+	tex_distance = _create_tex(tex_w, tex_h, RenderingDevice.DATA_FORMAT_R32_SFLOAT)
+	tex_cascades = _create_tex(CASCADE_TEX_W, cascade_tex_h, rgba16f)
+	tex_output = _create_tex(tex_w, tex_h, rgba16f)
+	tex_display = _create_tex(tex_w, tex_h, RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM)
+	# history 第一次以权重 0 参与混合，0 × 未初始化的 NaN 仍是 NaN，先清零
+	for tex in tex_history + [tex_display]:
+		rd.texture_clear(tex, Color(0, 0, 0, 0), 0, 1, 0, 1)
 
 	_load_shaders()
+	_build_static_uniform_sets()
 
 
 func set_agent_buffers(px: RID, py: RID, info: RID, colors: RID, hit_flash: RID) -> void:
@@ -140,9 +145,10 @@ func set_agent_buffers(px: RID, py: RID, info: RID, colors: RID, hit_flash: RID)
 	buf_hit_flash = hit_flash
 
 
-func set_laser_buffers(lines: RID, ttl: RID) -> void:
-	buf_laser_lines = lines
-	buf_laser_ttl = ttl
+## compact：GPUAgents.buf_laser_compact（主提交里 laser_compact.glsl 写好的紧凑激光列表），cap：它的容量 LASER_CAP
+func set_laser_buffer(compact: RID, cap: int) -> void:
+	buf_laser_compact = compact
+	laser_cap = cap
 
 
 func set_terrain_buffer(terrain: RID, grid_w: int, grid_h: int, cell_size: float) -> void:
@@ -152,111 +158,97 @@ func set_terrain_buffer(terrain: RID, grid_w: int, grid_h: int, cell_size: float
 	terrain_cell_size = cell_size
 
 
+## laser_count：本帧压缩出的激光条数（crowd_sim._laser_count，可能超过 cap，超出的不发光）
 func compute_gi(agent_count: int, region_origin: Vector2, region_size: Vector2,
-		splat_radius: float, emit_strength: float) -> void:
+		splat_radius: float, emit_strength: float, laser_count: int = 0) -> void:
 	if not _has_agent_buffers():
 		return
 
 	var region_stable := temporal_valid and _is_same_region(region_origin, region_size)
-	_update_temporal_params(temporal_blend if region_stable else 0.0)
-	_update_emit_params(agent_count, region_origin, region_size, splat_radius, emit_strength)
-	_update_interval_params()
+	_update_params(agent_count, region_origin, region_size, splat_radius, emit_strength, laser_count,
+			temporal_blend if region_stable else 0.0)
 	_last_region_origin = region_origin
 	_last_region_size = region_size
 
-	_frame_uniform_sets.clear()
 	var cl := rd.compute_list_begin()
 
-	_dispatch_clear(cl, tex_emit)
+	_dispatch_clear_walls(cl)
 	rd.compute_list_add_barrier(cl)
 
-	_dispatch_wall_mask(cl)
+	_dispatch_emit(cl)
 	rd.compute_list_add_barrier(cl)
-
-	_dispatch_emit(cl, agent_count, region_origin, region_size, splat_radius, emit_strength)
-	rd.compute_list_add_barrier(cl)
-
-	_dispatch_laser_emit(cl, agent_count)
-	rd.compute_list_add_barrier(cl)
-
-	if debug_stage == 0:
-		_dispatch_resample(cl, tex_emit)
-		tex_display = tex_output
-		_finish_compute(cl)
-		return
 
 	_dispatch_seed(cl)
 	rd.compute_list_add_barrier(cl)
 
-	if debug_stage == 1:
-		_dispatch_resample(cl, tex_jfa)
-		tex_display = tex_output
+	if debug_stage == 0 or debug_stage == 1:
+		_dispatch_resample(cl)
 		_finish_compute(cl)
 		return
 
 	_dispatch_jfa(cl)
-	rd.compute_list_add_barrier(cl)
 
 	_dispatch_distance(cl)
 	rd.compute_list_add_barrier(cl)
 
 	if debug_stage == 2:
-		_dispatch_resample(cl, tex_distance)
-		tex_display = tex_output
+		_dispatch_resample(cl)
 		_finish_compute(cl)
 		return
 
 	_dispatch_radiance_cascades(cl)
 
 	if debug_stage == 3:
-		_dispatch_resample(cl, cascade_textures[0])
-		tex_display = tex_output
-	else:
-		_dispatch_image(cl)
-		rd.compute_list_add_barrier(cl)
-		_dispatch_stabilize(cl)
+		_dispatch_resample(cl)
+		_finish_compute(cl)
+		return
 
+	_dispatch_image(cl)
+	rd.compute_list_add_barrier(cl)
+	_dispatch_stabilize(cl)
 	_finish_compute(cl)
-	if debug_stage == 4:
-		_swap_temporal_output()
-		temporal_valid = true
+	_hist = 1 - _hist
+	temporal_valid = true
 
 
 func get_output_image() -> Image:
-	var source := tex_display if tex_display.is_valid() else tex_output
 	var raw := _out_raw
 	_out_raw = PackedByteArray()
-	# 优先用 _finish_compute 登记、随 sync() 到达的数据；缺失（或不是这张纹理的）时退回同步回读
-	if _out_tex != source or raw.size() != tex_w * tex_h * 16: raw = rd.texture_get_data(source, 0)
-	return Image.create_from_data(tex_w, tex_h, false, Image.FORMAT_RGBAF, raw)
+	# 优先用 _finish_compute 登记、随 sync() 到达的数据；缺失时退回同步回读
+	if raw.size() != tex_w * tex_h * 4: raw = rd.texture_get_data(tex_display, 0)
+	return Image.create_from_data(tex_w, tex_h, false, Image.FORMAT_RGBA8, raw)
 
 
 func cleanup() -> void:
 	if rd == null:
 		return
 
+	# uniform set 先于其引用的纹理 / 缓冲 / shader 释放（依赖若已在别处释放，Godot 已连带释放了 set）
+	var sets: Array[RID] = [_us_wall, _us_seed, _us_distance, _us_image, _us_resample]
+	sets.append_array(_us_jfa)
+	sets.append_array(_us_cascade)
+	sets.append_array(_us_stabilize)
+	for us in _us_emit.values():
+		sets.append(us)
+	for us in sets:
+		_free_uniform_set(us)
+	_us_emit.clear()
+
 	var free_rid := func(rid: RID) -> void:
 		if rid.is_valid():
 			rd.free_rid(rid)
 
-	for us in _frame_uniform_sets:
-		free_rid.call(us)
-	_frame_uniform_sets.clear()
-
 	for rid in [
-		tex_emit, tex_output, tex_history, tex_stable, tex_jfa, tex_jfa_prev, tex_distance,
-		consts_buf, emit_params_buf, image_params_buf, temporal_params_buf,
-		pip_clear, pip_emit, pip_laser_emit, pip_seed, pip_jfa, pip_distance, pip_wall_mask, pip_cube_a, pip_image, pip_stabilize, pip_resample,
-		shd_clear, shd_emit, shd_laser_emit, shd_seed, shd_jfa, shd_distance, shd_wall_mask, shd_cube_a, shd_image, shd_stabilize, shd_resample,
+		tex_emit, tex_distance, tex_cascades, tex_output, tex_display,
+		params_buf, buf_emit_acc,
+		pip_wall_mask, pip_emit, pip_seed, pip_jfa, pip_distance, pip_cube_a, pip_image, pip_stabilize, pip_resample,
+		shd_wall_mask, shd_emit, shd_seed, shd_jfa, shd_distance, shd_cube_a, shd_image, shd_stabilize, shd_resample,
 	]:
 		free_rid.call(rid)
 
-	for rid in cascade_textures:
-		free_rid.call(rid)
-	for rid in jfa_params_bufs:
-		free_rid.call(rid)
-	for rid in cube_params_bufs:
-		free_rid.call(rid)
+	for arr in [tex_jfa, tex_history, jfa_params_bufs, cascade_params_bufs]:
+		for rid in arr:
+			free_rid.call(rid)
 
 	rd = null
 
@@ -265,194 +257,87 @@ func _has_agent_buffers() -> bool:
 	return buf_pos_x.is_valid() and buf_pos_y.is_valid() and buf_agent_info.is_valid() and buf_fac_colors.is_valid() and buf_hit_flash.is_valid()
 
 
-func _has_laser_buffers() -> bool:
-	return buf_laser_lines.is_valid() and buf_laser_ttl.is_valid()
-
-
-func _dispatch_clear(cl: int, tex: RID) -> void:
-	var us := _uniform_set([_img_uniform(0, tex)], shd_clear)
-	rd.compute_list_bind_compute_pipeline(cl, pip_clear)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
-	rd.compute_list_dispatch(cl, ceili(float(_texture_width(tex)) / 16.0), ceili(float(_texture_height(tex)) / 16.0), 1)
-
-
-func _dispatch_emit(cl: int, agent_count: int, region_origin: Vector2, region_size: Vector2,
-		splat_radius: float, emit_strength: float) -> void:
-	var us := _uniform_set([
-		_buf_uniform(0, buf_pos_x),
-		_buf_uniform(1, buf_pos_y),
-		_buf_uniform(2, buf_agent_info),
-		_buf_uniform(3, buf_fac_colors),
-		_img_uniform(4, tex_emit),
-		_buf_uniform(5, emit_params_buf),
-		_buf_uniform(6, buf_hit_flash),
-	], shd_emit)
-
-	rd.compute_list_bind_compute_pipeline(cl, pip_emit)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
-	rd.compute_list_dispatch(cl, ceili(float(agent_count) / 64.0), 1, 1)
-
-
-func _dispatch_laser_emit(cl: int, agent_count: int) -> void:
-	if not _has_laser_buffers():
-		return
-	var us := _uniform_set([
-		_buf_uniform(0, buf_agent_info),
-		_buf_uniform(1, buf_fac_colors),
-		_buf_uniform(2, buf_laser_lines),
-		_buf_uniform(3, buf_laser_ttl),
-		_img_uniform(4, tex_emit),
-		_buf_uniform(5, emit_params_buf),
-	], shd_laser_emit)
-
-	rd.compute_list_bind_compute_pipeline(cl, pip_laser_emit)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
-	rd.compute_list_dispatch(cl, ceili(float(agent_count) / 64.0), 1, 1)
-
-
-func _dispatch_wall_mask(cl: int) -> void:
-	if not buf_terrain.is_valid():
-		return
-	var us := _uniform_set([
-		_buf_uniform(0, buf_terrain),
-		_img_uniform(1, tex_emit),
-		_buf_uniform(2, emit_params_buf),
-	], shd_wall_mask)
-
+func _dispatch_clear_walls(cl: int) -> void:
 	rd.compute_list_bind_compute_pipeline(cl, pip_wall_mask)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _wall_uniform_set(), 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
-func _dispatch_seed(cl: int) -> void:
-	var us := _uniform_set([
-		_buf_uniform(0, consts_buf),
-		_img_uniform(1, tex_jfa),
-		_img_uniform(2, tex_emit),
-	], shd_seed)
+func _dispatch_emit(cl: int) -> void:
+	var threads := _emit_agents + _emit_lasers * LASER_THREADS
+	if threads <= 0:
+		return
+	rd.compute_list_bind_compute_pipeline(cl, pip_emit)
+	rd.compute_list_bind_uniform_set(cl, _emit_uniform_set(), 0)
+	rd.compute_list_dispatch(cl, ceili(float(threads) / 64.0), 1, 1)
 
+
+func _dispatch_seed(cl: int) -> void:
 	rd.compute_list_bind_compute_pipeline(cl, pip_seed)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _us_seed, 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
 func _dispatch_jfa(cl: int) -> void:
-	for i in range(jfa_passes - 1, -1, -1):
-		_swap_jfa()
-		var us := _uniform_set([
-			_buf_uniform(0, consts_buf),
-			_img_uniform(1, tex_jfa),
-			_img_uniform(2, tex_jfa_prev),
-			_buf_uniform(4, jfa_params_bufs[i]),
-		], shd_jfa)
-
+	for k in range(jfa_passes):
 		rd.compute_list_bind_compute_pipeline(cl, pip_jfa)
-		rd.compute_list_bind_uniform_set(cl, us, 0)
+		rd.compute_list_bind_uniform_set(cl, _us_jfa[k], 0)
 		rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 		rd.compute_list_add_barrier(cl)
 
 
 func _dispatch_distance(cl: int) -> void:
-	var us := _uniform_set([
-		_buf_uniform(0, consts_buf),
-		_img_uniform(1, tex_distance),
-		_img_uniform(2, tex_jfa),
-	], shd_distance)
-
 	rd.compute_list_bind_compute_pipeline(cl, pip_distance)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _us_distance, 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
-func _dispatch_radiance_cascades(cl: int) -> void:
-	for face in range(num_cascades - 1, -1, -1):
-		var us := _uniform_set(_cascade_uniforms([
-			_buf_uniform(0, consts_buf),
-			_buf_uniform(1, cube_params_bufs[face]),
-			_img_uniform(2, tex_emit),
-			_img_uniform(3, tex_distance),
-		]), shd_cube_a)
+func _dispatch_cascade(cl: int, c: int) -> void:
+	# 一个线程一个本级像素；组数超过 65535 时拆成二维（shader 按 gl_NumWorkGroups 还原线性下标）
+	var groups := ceili(float(cascade_counts[c]) / 64.0)
+	var gx := mini(groups, 65535)
+	rd.compute_list_bind_compute_pipeline(cl, pip_cube_a)
+	rd.compute_list_bind_uniform_set(cl, _us_cascade[c], 0)
+	rd.compute_list_dispatch(cl, gx, ceili(float(groups) / float(gx)), 1)
 
-		rd.compute_list_bind_compute_pipeline(cl, pip_cube_a)
-		rd.compute_list_bind_uniform_set(cl, us, 0)
-		rd.compute_list_dispatch(cl, ceili(float(cascade_size.x) / 16.0), ceili(float(cascade_size.y) / 16.0), 1)
+
+func _dispatch_radiance_cascades(cl: int) -> void:
+	# 从最高级到 0 级：第 c 级读第 c + 1 级，级间 barrier 保证读到的是本次更新刚写完的数据
+	for c in range(num_cascades - 1, -1, -1):
+		_dispatch_cascade(cl, c)
 		rd.compute_list_add_barrier(cl)
 
 
 func _dispatch_image(cl: int) -> void:
-	var us := _uniform_set(_cascade_uniforms([
-		_buf_uniform(0, consts_buf),
-		_img_uniform(1, tex_output),
-		_img_uniform(2, tex_emit),
-		_buf_uniform(3, image_params_buf),
-	]), shd_image)
-
 	rd.compute_list_bind_compute_pipeline(cl, pip_image)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _us_image, 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
 func _dispatch_stabilize(cl: int) -> void:
-	var us := _uniform_set([
-		_img_uniform(0, tex_output),
-		_img_uniform(1, tex_history),
-		_img_uniform(2, tex_stable),
-		_buf_uniform(3, temporal_params_buf),
-	], shd_stabilize)
-
 	rd.compute_list_bind_compute_pipeline(cl, pip_stabilize)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _us_stabilize[_hist], 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
-func _dispatch_resample(cl: int, source_tex: RID) -> void:
-	var us := _uniform_set([
-		_img_uniform(1, tex_output),
-		_img_uniform(2, source_tex),
-	], shd_resample)
-
+# debug_stage 0..3：把对应的中间结果重采样到显示纹理
+func _dispatch_resample(cl: int) -> void:
 	rd.compute_list_bind_compute_pipeline(cl, pip_resample)
-	rd.compute_list_bind_uniform_set(cl, us, 0)
+	rd.compute_list_bind_uniform_set(cl, _us_resample, 0)
 	rd.compute_list_dispatch(cl, ceili(float(tex_w) / 16.0), ceili(float(tex_h) / 16.0), 1)
 
 
 func _finish_compute(cl: int) -> void:
 	rd.compute_list_end()
-	# 登记本次要显示的纹理的异步回读，数据随 sync() 到达
-	_out_tex = _next_display_tex()
+	# 登记显示纹理的异步回读，数据随 sync() 到达
 	_out_raw = PackedByteArray()
-	rd.texture_get_data_async(_out_tex, 0, _on_output_data)
+	rd.texture_get_data_async(tex_display, 0, _on_output_data)
 	rd.submit()
 	rd.sync()
-
-	for us in _frame_uniform_sets:
-		if us.is_valid():
-			rd.free_rid(us)
-	_frame_uniform_sets.clear()
-
-
-# 本次 compute_gi 结束后要显示的纹理：stage 4 的结果写在 tex_stable，_finish_compute 之后才由
-# _swap_temporal_output 换成 tex_history / tex_display；其余 stage 在 _finish_compute 之前已设好 tex_display
-func _next_display_tex() -> RID:
-	if debug_stage == 4: return tex_stable
-	return tex_display if tex_display.is_valid() else tex_output
 
 
 func _on_output_data(data: PackedByteArray) -> void:
 	_out_raw = data
-
-
-func _swap_jfa() -> void:
-	var tmp := tex_jfa
-	tex_jfa = tex_jfa_prev
-	tex_jfa_prev = tmp
-
-
-func _swap_temporal_output() -> void:
-	var tmp := tex_history
-	tex_history = tex_stable
-	tex_stable = tmp
-	tex_display = tex_history
 
 
 func _is_same_region(region_origin: Vector2, region_size: Vector2) -> bool:
@@ -464,39 +349,48 @@ func _is_same_region(region_origin: Vector2, region_size: Vector2) -> bool:
 	)
 
 
+# 与 gi_rc_cube_a.glsl 的 GetC0Size / GetCascadeSize / GetCascadeLinearOffset 相同：
+# c0 探针数 (512, 512·h/w)、方向数 4；第 i 级探针数每轴 >> i（至少 1），方向数 × 4^i
+func _compute_cascade_layout() -> void:
+	var c0 := Vector2i(512, (512 * tex_h) / tex_w)
+	cascade_counts.resize(num_cascades)
+	cascade_offsets.resize(num_cascades)
+	var offset := 0
+	for i in range(num_cascades):
+		cascade_offsets[i] = offset
+		cascade_counts[i] = maxi(1, c0.x >> i) * maxi(1, c0.y >> i) * (4 << (2 * i))
+		offset += cascade_counts[i]
+	cascade_tex_h = ceili(float(offset) / float(CASCADE_TEX_W))
+
+
 func _create_static_param_buffers() -> void:
 	jfa_params_bufs.clear()
-	for i in range(jfa_passes):
-		var jfa_bytes := PackedFloat32Array([pow(2.0, i)]).to_byte_array()
+	for k in range(jfa_passes):
+		# 第 k 遍的跳距：2^(jfa_passes - 1) … 1
+		var jfa_bytes := PackedFloat32Array([pow(2.0, jfa_passes - 1 - k)]).to_byte_array()
 		jfa_bytes.resize(16)
 		jfa_params_bufs.append(rd.storage_buffer_create(jfa_bytes.size(), jfa_bytes))
 
-	cube_params_bufs.clear()
-	for face in range(6):
-		var cube_bytes := PackedByteArray()
-		cube_bytes.resize(32)
-		cube_bytes.encode_s32(0, face)
-		cube_bytes.encode_s32(4, num_cascades)
-		cube_bytes.encode_s32(8, cascade_size.x)
-		cube_bytes.encode_s32(12, cascade_size.y)
-		cube_bytes.encode_s32(16, merge_fix)
-		cube_bytes.encode_float(20, interval_scale)
-		cube_params_bufs.append(rd.storage_buffer_create(cube_bytes.size(), cube_bytes))
-
-	var image_bytes := PackedByteArray()
-	image_bytes.resize(16)
-	image_bytes.encode_s32(0, num_cascades)
-	image_bytes.encode_s32(4, cascade_size.x)
-	image_bytes.encode_s32(8, cascade_size.y)
-	image_bytes.encode_float(12, interval_scale)
-	image_params_buf = rd.storage_buffer_create(image_bytes.size(), image_bytes)
+	cascade_params_bufs.clear()
+	for c in range(num_cascades):
+		var cascade_bytes := PackedInt32Array([c, cascade_counts[c], 0, 0]).to_byte_array()
+		cascade_params_bufs.append(rd.storage_buffer_create(cascade_bytes.size(), cascade_bytes))
 
 
-func _update_emit_params(agent_count: int, region_origin: Vector2, region_size: Vector2,
-		splat_radius: float, emit_strength: float) -> void:
+# 布局（字节偏移）与各 shader 的 ParamsBuffer / GIParamsBuffer 一致（各取所需的前缀）：
+# 0 agent_count, 4 tex_w, 8 tex_h, 12..24 region xywh, 28 splat_radius, 32 emit_strength,
+# 36 terrain_w, 40 terrain_h, 44 terrain_cell_size, 48 wall_alpha, 52 laser_width,
+# 56 laser_emit_strength, 60 laser_life, 64 laser_count, 68 laser_cap, 72 interval_scale,
+# 76 history_weight, 80 spatial_strength, 84 num_cascades, 88 merge_fix, 92 debug_stage
+func _update_params(agent_count: int, region_origin: Vector2, region_size: Vector2,
+		splat_radius: float, emit_strength: float, laser_count: int, history_weight: float) -> void:
+	_emit_agents = maxi(agent_count, 0)
+	var lasers_ok := buf_laser_compact.is_valid() and laser_cap > 0 and laser_life > 0.0
+	_emit_lasers = clampi(laser_count, 0, laser_cap) if lasers_ok else 0
+	var has_terrain := buf_terrain.is_valid()
 	var bytes := PackedByteArray()
-	bytes.resize(64)
-	bytes.encode_s32(0, agent_count)
+	bytes.resize(PARAMS_SIZE)
+	bytes.encode_s32(0, _emit_agents)
 	bytes.encode_float(4, float(tex_w))
 	bytes.encode_float(8, float(tex_h))
 	bytes.encode_float(12, region_origin.x)
@@ -505,55 +399,128 @@ func _update_emit_params(agent_count: int, region_origin: Vector2, region_size: 
 	bytes.encode_float(24, region_size.y)
 	bytes.encode_float(28, splat_radius)
 	bytes.encode_float(32, emit_strength)
-	bytes.encode_s32(36, terrain_grid_w)
-	bytes.encode_s32(40, terrain_grid_h)
+	bytes.encode_s32(36, terrain_grid_w if has_terrain else 0)
+	bytes.encode_s32(40, terrain_grid_h if has_terrain else 0)
 	bytes.encode_float(44, terrain_cell_size)
 	bytes.encode_float(48, 1.0)
 	bytes.encode_float(52, laser_width)
 	bytes.encode_float(56, laser_emit_strength)
 	bytes.encode_float(60, laser_life)
-	rd.buffer_update(emit_params_buf, 0, bytes.size(), bytes)
+	bytes.encode_s32(64, _emit_lasers)
+	bytes.encode_s32(68, laser_cap)
+	bytes.encode_float(72, clampf(interval_scale, 0.125, 8.0))
+	bytes.encode_float(76, clampf(history_weight, 0.0, 0.98))
+	bytes.encode_float(80, clampf(spatial_filter_strength, 0.0, 1.0))
+	bytes.encode_s32(84, num_cascades)
+	bytes.encode_s32(88, merge_fix)
+	bytes.encode_s32(92, debug_stage)
+	rd.buffer_update(params_buf, 0, bytes.size(), bytes)
 
 
-func _update_temporal_params(history_weight: float) -> void:
-	var bytes := PackedByteArray()
-	bytes.resize(16)
-	bytes.encode_float(0, clampf(history_weight, 0.0, 0.98))
-	bytes.encode_float(4, clampf(spatial_filter_strength, 0.0, 1.0))
-	bytes.encode_s32(8, 0)
-	bytes.encode_s32(12, 0)
-	rd.buffer_update(temporal_params_buf, 0, bytes.size(), bytes)
+func _build_static_uniform_sets() -> void:
+	_us_seed = _uniform_set(shd_seed, [
+		_buf_uniform(0, buf_emit_acc),
+		_img_uniform(1, tex_emit),
+		_img_uniform(2, tex_jfa[0]),
+	])
+	_us_jfa.clear()
+	for k in range(jfa_passes):
+		_us_jfa.append(_uniform_set(shd_jfa, [
+			_img_uniform(1, tex_jfa[(k + 1) % 2]),
+			_img_uniform(2, tex_jfa[k % 2]),
+			_buf_uniform(4, jfa_params_bufs[k]),
+		]))
+	_us_distance = _uniform_set(shd_distance, [
+		_img_uniform(1, tex_distance),
+		_img_uniform(2, tex_jfa[jfa_passes % 2]),
+	])
+	_us_cascade.clear()
+	for c in range(num_cascades):
+		_us_cascade.append(_uniform_set(shd_cube_a, [
+			_buf_uniform(0, params_buf),
+			_buf_uniform(1, cascade_params_bufs[c]),
+			_img_uniform(2, tex_emit),
+			_img_uniform(3, tex_distance),
+			_img_uniform(10, tex_cascades),
+		]))
+	_us_image = _uniform_set(shd_image, [
+		_buf_uniform(0, params_buf),
+		_img_uniform(1, tex_output),
+		_img_uniform(10, tex_cascades),
+	])
+	_us_stabilize.clear()
+	for h in range(2):
+		_us_stabilize.append(_uniform_set(shd_stabilize, [
+			_img_uniform(0, tex_output),
+			_img_uniform(1, tex_history[h]),
+			_img_uniform(2, tex_history[1 - h]),
+			_buf_uniform(3, params_buf),
+			_img_uniform(4, tex_display),
+		]))
+	_us_resample = _uniform_set(shd_resample, [
+		_buf_uniform(0, params_buf),
+		_img_uniform(1, tex_display),
+		_img_uniform(2, tex_emit),
+		_img_uniform(3, tex_jfa[0]),
+		_img_uniform(4, tex_distance),
+		_img_uniform(5, tex_cascades),
+	])
 
 
-func _update_interval_params() -> void:
-	var bytes := PackedByteArray()
-	bytes.resize(4)
-	bytes.encode_float(0, clampf(interval_scale, 0.125, 8.0))
-	if image_params_buf.is_valid():
-		rd.buffer_update(image_params_buf, 12, 4, bytes)
-	for buf in cube_params_bufs:
-		if buf.is_valid():
-			rd.buffer_update(buf, 20, 4, bytes)
+func _wall_uniform_set() -> RID:
+	# 没有地形缓冲时绑一个占位缓冲，参数里 terrain_w = 0 让 shader 跳过墙体
+	var terrain := buf_terrain if buf_terrain.is_valid() else params_buf
+	if _us_wall_terrain == terrain and rd.uniform_set_is_valid(_us_wall): return _us_wall
+	_free_uniform_set(_us_wall)
+	_us_wall = _uniform_set(shd_wall_mask, [
+		_buf_uniform(0, terrain),
+		_buf_uniform(1, buf_emit_acc),
+		_buf_uniform(2, params_buf),
+	])
+	_us_wall_terrain = terrain
+	return _us_wall
 
 
-func _cascade_uniforms(base_uniforms: Array) -> Array:
-	var uniforms := base_uniforms.duplicate()
-	for i in range(6):
-		uniforms.append(_img_uniform(10 + i, cascade_textures[i]))
-	return uniforms
-
-
-func _uniform_set(uniforms: Array, shader: RID) -> RID:
-	var us := rd.uniform_set_create(uniforms, shader, 0)
-	_frame_uniform_sets.append(us)
+func _emit_uniform_set() -> RID:
+	var laser := buf_laser_compact if buf_laser_compact.is_valid() else params_buf
+	var key := [buf_pos_x, buf_pos_y, buf_agent_info, buf_fac_colors, buf_hit_flash, laser]
+	var us: RID = _us_emit.get(key, RID())
+	if rd.uniform_set_is_valid(us): return us
+	# 缓冲换了，或被释放（Godot 会连带释放引用它的 set）：丢掉失效项，已有两份时全部重建
+	for k in _us_emit.keys():
+		if not rd.uniform_set_is_valid(_us_emit[k]): _us_emit.erase(k)
+	if _us_emit.size() >= 2:
+		for old in _us_emit.values():
+			_free_uniform_set(old)
+		_us_emit.clear()
+	us = _uniform_set(shd_emit, [
+		_buf_uniform(0, buf_pos_x),
+		_buf_uniform(1, buf_pos_y),
+		_buf_uniform(2, buf_agent_info),
+		_buf_uniform(3, buf_fac_colors),
+		_buf_uniform(4, buf_emit_acc),
+		_buf_uniform(5, params_buf),
+		_buf_uniform(6, buf_hit_flash),
+		_buf_uniform(7, laser),
+	])
+	_us_emit[key] = us
 	return us
 
 
-func _create_tex(w: int, h: int) -> RID:
+func _uniform_set(shader: RID, uniforms: Array) -> RID:
+	return rd.uniform_set_create(uniforms, shader, 0)
+
+
+func _free_uniform_set(us: RID) -> void:
+	if us.is_valid() and rd.uniform_set_is_valid(us):
+		rd.free_rid(us)
+
+
+func _create_tex(w: int, h: int, format: RenderingDevice.DataFormat) -> RID:
 	var fmt := RDTextureFormat.new()
 	fmt.width = w
 	fmt.height = h
-	fmt.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
+	fmt.format = format
 	fmt.usage_bits = (
 		RenderingDevice.TEXTURE_USAGE_STORAGE_BIT
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT
@@ -570,25 +537,21 @@ func _zero_bytes(count: int) -> PackedByteArray:
 
 
 func _load_shaders() -> void:
-	shd_clear = _load_shader("res://shaders/gi_clear.glsl")
+	shd_wall_mask = _load_shader("res://shaders/gi_wall_mask.glsl")
 	shd_emit = _load_shader("res://shaders/gi_agent_emit.glsl")
-	shd_laser_emit = _load_shader("res://shaders/gi_laser_emit.glsl")
 	shd_seed = _load_shader("res://shaders/gi_seed.glsl")
 	shd_jfa = _load_shader("res://shaders/gi_jump_flood_algorithm.glsl")
 	shd_distance = _load_shader("res://shaders/gi_distance.glsl")
-	shd_wall_mask = _load_shader("res://shaders/gi_wall_mask.glsl")
 	shd_cube_a = _load_shader("res://shaders/gi_rc_cube_a.glsl")
 	shd_image = _load_shader("res://shaders/gi_rc_image.glsl")
 	shd_stabilize = _load_shader("res://shaders/gi_stabilize.glsl")
 	shd_resample = _load_shader("res://shaders/gi_resample_image.glsl")
 
-	pip_clear = rd.compute_pipeline_create(shd_clear)
+	pip_wall_mask = rd.compute_pipeline_create(shd_wall_mask)
 	pip_emit = rd.compute_pipeline_create(shd_emit)
-	pip_laser_emit = rd.compute_pipeline_create(shd_laser_emit)
 	pip_seed = rd.compute_pipeline_create(shd_seed)
 	pip_jfa = rd.compute_pipeline_create(shd_jfa)
 	pip_distance = rd.compute_pipeline_create(shd_distance)
-	pip_wall_mask = rd.compute_pipeline_create(shd_wall_mask)
 	pip_cube_a = rd.compute_pipeline_create(shd_cube_a)
 	pip_image = rd.compute_pipeline_create(shd_image)
 	pip_stabilize = rd.compute_pipeline_create(shd_stabilize)
@@ -622,15 +585,3 @@ func _buf_uniform(binding: int, buf: RID) -> RDUniform:
 	u.binding = binding
 	u.add_id(buf)
 	return u
-
-
-func _texture_width(tex: RID) -> int:
-	if tex == tex_emit or tex == tex_output or tex == tex_history or tex == tex_stable or tex == tex_jfa or tex == tex_jfa_prev or tex == tex_distance:
-		return tex_w
-	return cascade_size.x
-
-
-func _texture_height(tex: RID) -> int:
-	if tex == tex_emit or tex == tex_output or tex == tex_history or tex == tex_stable or tex == tex_jfa or tex == tex_jfa_prev or tex == tex_distance:
-		return tex_h
-	return cascade_size.y

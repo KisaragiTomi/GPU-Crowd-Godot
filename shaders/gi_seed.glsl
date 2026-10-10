@@ -1,23 +1,24 @@
 #[compute]
 #version 450
 
-layout(local_size_x=16,local_size_y=16)in;
+// 把 emission 累加缓冲（fp32 位模式）转成 RGBA16F emission 纹理，同时生成 JFA 种子
+layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set=0,binding=0,std430)buffer ConstBuffer{
-    uint add_data;
-}consts;
+layout(set = 0, binding = 0, std430) restrict readonly buffer EmitAccBuffer {
+	uvec4 emit_acc[];
+};
+layout(set = 0, binding = 1, rgba16f) restrict writeonly uniform image2D emit_image;
+// 种子 = 像素坐标 x | y << 16，0 表示无种子（与原实现一样，(0,0) 处的种子也当作无）
+layout(set = 0, binding = 2, r32ui) restrict writeonly uniform uimage2D seed_image;
 
-layout(set=0,binding=1,rgba32f)writeonly uniform image2D output_image;
-layout(set=0,binding=2,rgba32f)readonly uniform image2D input_image;
+void main() {
+	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 sz = imageSize(emit_image);
+	if (pos.x >= sz.x || pos.y >= sz.y) return;
 
-void main(){
-    vec2 fragCoord=gl_GlobalInvocationID.xy;
-    ivec2 ifragCoord=ivec2(fragCoord.xy);
-    ivec2 input_image_size=imageSize(input_image).xy;
-    vec2 vUv=fragCoord.xy/input_image_size;
-
-
-    float alpha = imageLoad(input_image, ifragCoord).a;
-    vec4 fragColor = alpha > 0.01 ? vec4(vUv, 0.0, 1.0) : vec4(0.0);
-    imageStore(output_image,ifragCoord,fragColor);
+	vec4 emit = uintBitsToFloat(emit_acc[pos.y * sz.x + pos.x]);
+	imageStore(emit_image, pos, emit);
+	// 阈值判断用 fp32 的 alpha，与原实现一致
+	uint seed = emit.a > 0.01 ? (uint(pos.x) | (uint(pos.y) << 16)) : 0u;
+	imageStore(seed_image, pos, uvec4(seed));
 }
