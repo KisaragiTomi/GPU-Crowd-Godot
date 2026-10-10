@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://denhxcaklqcov"
+path="res://.godot/imported/select_inspect.glsl-c76494946b5e779c4d318804bf3628e5.res"
+
+[deps]
+
+source_file="res://shaders/select_inspect.glsl"
+dest_files=["res://.godot/imported/select_inspect.glsl-c76494946b5e779c4d318804bf3628e5.res"]
+
+[params]
+

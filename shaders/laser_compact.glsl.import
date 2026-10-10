@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bws2r54aqiwmd"
+path="res://.godot/imported/laser_compact.glsl-3584dd3bdc190cb8acd64131c6da8b50.res"
+
+[deps]
+
+source_file="res://shaders/laser_compact.glsl"
+dest_files=["res://.godot/imported/laser_compact.glsl-3584dd3bdc190cb8acd64131c6da8b50.res"]
+
+[params]
+

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ddh33laxjd13g"
+path="res://.godot/imported/std_compact_tiles.glsl-c24cc3303c16ad6d09c6e22bc6a095bf.res"
+
+[deps]
+
+source_file="res://shaders/std_compact_tiles.glsl"
+dest_files=["res://.godot/imported/std_compact_tiles.glsl-c24cc3303c16ad6d09c6e22bc6a095bf.res"]
+
+[params]
+

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dseukft23ogpt"
+path="res://.godot/imported/gi_stabilize.glsl-c9480f39c936c5185692a4da20a32ebd.res"
+
+[deps]
+
+source_file="res://shaders/gi_stabilize.glsl"
+dest_files=["res://.godot/imported/gi_stabilize.glsl-c9480f39c936c5185692a4da20a32ebd.res"]
+
+[params]
+
